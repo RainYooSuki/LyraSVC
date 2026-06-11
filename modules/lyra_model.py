@@ -193,7 +193,7 @@ class RoughMelDecoder(nn.Module):
 
 
 # ============================================================
-# 3. DDPM helpers
+# 3. DDPM 噪声调度与扩散
 # ============================================================
 
 def extract(a, t, x_shape):
@@ -219,25 +219,97 @@ def denorm_spec(x):
 
 
 # ============================================================
-# 5. Position embedding (1D sincos, adapted from official 2D)
+# 5. YaRN Rotary Position Embedding
 # ============================================================
 
-def get_1d_sincos_pos_embed(embed_dim, length):
-    pos = np.arange(length, dtype=np.float32)
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000 ** omega
-    out = np.einsum('m,d->md', pos, omega)
-    emb_sin = np.sin(out)
-    emb_cos = np.cos(out)
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)
-    if embed_dim % 2:
-        emb = np.concatenate([emb, np.zeros((length, 1), dtype=np.float32)], axis=1)
-    return emb
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+def _yarn_find_correction_dim(num_rotations, dim, base, max_pos):
+    return (dim * math.log(max_pos / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
+def _yarn_find_correction_range(low_rot, high_rot, dim, base, max_pos):
+    low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_pos))
+    high = math.ceil(_yarn_find_correction_dim(high_rot, dim, base, max_pos))
+    return max(low, 0), min(high, dim - 1)
+
+def _yarn_linear_ramp_mask(min_val, max_val, dim):
+    if min_val == max_val:
+        max_val += 0.001
+    linear = (torch.arange(dim, dtype=torch.float32) - min_val) / (max_val - min_val)
+    return torch.clamp(linear, 0, 1)
+
+def _yarn_get_mscale(scale=1.0):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * math.log(scale) + 1.0
+
+
+class RotaryPositionEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim: int = 64,
+        max_pos: int = 4096,
+        base: float = 10000.0,
+        scale: float = 1.0,
+        original_max_pos: int = 384,
+        extrapolation_factor: float = 1.0,
+        attn_factor: float = 1.0,
+        beta_fast: int = 32,
+        beta_slow: int = 1,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_pos = max_pos
+        self.base = base
+        self.scale = scale
+        self.original_max_pos = original_max_pos
+        self.extrapolation_factor = extrapolation_factor
+        self.attn_factor = attn_factor
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+
+        pos_freqs = base ** (torch.arange(0, dim, 2).float() / dim)
+        inv_freq_ext = 1.0 / pos_freqs
+        inv_freq_int = 1.0 / (scale * pos_freqs)
+
+        low, high = _yarn_find_correction_range(beta_fast, beta_slow, dim, base, original_max_pos)
+        mask = (1 - _yarn_linear_ramp_mask(low, high, dim // 2)) * extrapolation_factor
+        inv_freq = inv_freq_int * (1 - mask) + inv_freq_ext * mask
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.mscale = float(_yarn_get_mscale(scale) * attn_factor)
+
+        self._cached_seq_len = max_pos
+        t = torch.arange(self._cached_seq_len, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", (emb.cos() * self.mscale), persistent=False)
+        self.register_buffer("sin_cached", (emb.sin() * self.mscale), persistent=False)
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        if seq_len > self._cached_seq_len:
+            self._cached_seq_len = seq_len
+            t = torch.arange(self._cached_seq_len, dtype=torch.float32, device=device)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self.register_buffer("cos_cached", (emb.cos() * self.mscale).to(dtype), persistent=False)
+            self.register_buffer("sin_cached", (emb.sin() * self.mscale).to(dtype), persistent=False)
+
+        cos = self.cos_cached[:seq_len].to(device=device, dtype=dtype)
+        sin = self.sin_cached[:seq_len].to(device=device, dtype=dtype)
+        return cos[None, None, :, :], sin[None, None, :, :]
 
 
 # ============================================================
-# 6. Official DiT components (from Facebook Research)
+# 6. DiT components
 # ============================================================
 
 def modulate(x, shift, scale):
@@ -297,10 +369,11 @@ class LabelEmbedder(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, rotary_emb=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.rotary_emb = rotary_emb
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -325,6 +398,11 @@ class DiTBlock(nn.Module):
         q = self.q_proj(x_norm).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x_norm).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x_norm).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if self.rotary_emb is not None:
+            cos, sin = self.rotary_emb(T, q.device, q.dtype)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
         attn_out = F.scaled_dot_product_attention(q, k, v)
         attn_out = attn_out.transpose(1, 2).reshape(B, T, D)
         attn_out = self.out_proj(attn_out)
@@ -367,6 +445,7 @@ class LyraModel(nn.Module):
         pitch_max_freq: float = 2000.0,
         use_ref_spk: bool = True,
         rough_decoder_hidden: int = 256,
+        segment_len: int = 384,           # 训练段长, 用于 YaRN 外推基准
         spec_min: float = -12.0,
         spec_max: float = 5.0,
         diffusion_timesteps: int = 1000,
@@ -402,15 +481,20 @@ class LyraModel(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.y_embedder = LabelEmbedder(num_speakers, hidden_dim, cfg_dropout_prob)
 
+        head_dim = hidden_dim // num_heads
+        self.rotary_emb = RotaryPositionEmbedding(
+            dim=head_dim,
+            max_pos=4096,
+            base=10000.0,
+            scale=1.0,
+            original_max_pos=segment_len,
+        )
+
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_dim, num_heads, mlp_ratio) for _ in range(depth)
+            DiTBlock(hidden_dim, num_heads, mlp_ratio, rotary_emb=self.rotary_emb)
+            for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_dim, mel_bins)
-
-        # --- Position embedding (1D sincos, frozen) ---
-        max_pos_len = 4096
-        pos_embed_np = get_1d_sincos_pos_embed(hidden_dim, max_pos_len)
-        self.register_buffer('pos_embed', torch.from_numpy(pos_embed_np).float().unsqueeze(0))
 
         # --- Build noise schedule ---
         self._build_noise_schedule(diffusion_timesteps, beta_start, beta_end)
@@ -449,6 +533,20 @@ class LyraModel(nn.Module):
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def set_rope_scale(self, scale: float):
+        """推理时设置 YaRN 外推比例。训练时 scale=1.0 不动。"""
+        head_dim = self.hidden_dim // self.blocks[0].num_heads
+        new_rotary = RotaryPositionEmbedding(
+            dim=head_dim,
+            max_pos=self.rotary_emb.max_pos,
+            base=self.rotary_emb.base,
+            scale=scale,
+            original_max_pos=self.rotary_emb.original_max_pos,
+        ).to(next(self.parameters()).device)
+        self.rotary_emb = new_rotary
+        for block in self.blocks:
+            block.rotary_emb = new_rotary
 
     def q_sample(self, x_start, t, noise):
         a = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
@@ -506,7 +604,6 @@ class LyraModel(nn.Module):
 
         # 7. DiT forward
         x = self.x_embedder(x)
-        x = x + self.pos_embed[:, :T, :]
         x = x + cond_inj
 
         for block in self.blocks:
@@ -579,7 +676,7 @@ class LyraModel(nn.Module):
                 spk_emb = self.y_embedder(speaker_ids, False, force_drop_ids=force_drop)
                 c = t_emb + spk_emb + cond_summary
 
-                x_proj = self.x_embedder(x) + self.pos_embed[:, :T_mel, :] + cond_inj
+                x_proj = self.x_embedder(x) + cond_inj
                 for block in self.blocks:
                     x_proj = block(x_proj, c)
                 return self.final_layer(x_proj, c)
@@ -629,6 +726,7 @@ class ModelConfig:
     dpm_steps: int = 20
     cfg_scale: float = 1.5
     learning_rate: float = 1e-4
+    segment_len: int = 384
 
     @classmethod
     def from_yaml(cls, config_path: str = "config/config.yaml") -> "ModelConfig":
@@ -667,6 +765,7 @@ class ModelConfig:
             learning_rate=t.get("learning_rate", 1e-4),
             dpm_steps=inf.get("dpm_steps", 20),
             cfg_scale=inf.get("cfg_scale", 1.5),
+            segment_len=t.get("segment_len", 384),
         )
 
 

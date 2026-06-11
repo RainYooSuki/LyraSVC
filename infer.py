@@ -14,6 +14,7 @@ import librosa
 import soundfile as sf
 
 from modules.lyra_model import LyraModel, ModelConfig, SPEC_MIN, SPEC_MAX
+from modules.slicer import Slicer, cross_fade
 from modules.whisper_ppg import WhisperPPGExtractor
 from modules.pitch import RMVPEExtractor
 from modules.mel import MelExtractor
@@ -36,6 +37,7 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
         pitch_max_freq=cfg.pitch_max_freq,
         use_ref_spk=cfg.use_ref_spk,
         rough_decoder_hidden=cfg.rough_decoder_hidden,
+        segment_len=cfg.segment_len,
         spec_min=cfg.spec_min,
         spec_max=cfg.spec_max,
         diffusion_timesteps=cfg.diffusion_timesteps,
@@ -113,58 +115,150 @@ def convert(
     energy_mel = mel_res[0].mel.cpu().numpy().T  # (128, T) → (T, 128)
     print(f"    Mel: {energy_mel.shape}")
 
-    # 5. LyraModel 生成目标 mel
-    T_mel = energy_mel.shape[0]
-    print(f"  Generating mel ({dpm_steps} DPM-Solver steps)...")
-    ppg_t = torch.from_numpy(ppg).float().unsqueeze(0).to(device)
-    f0_t = torch.from_numpy(f0).float().unsqueeze(0).to(device)
-    energy_t = torch.from_numpy(energy_mel).float().unsqueeze(0).to(device)
+    # 5. Slice by silence and process each segment
     spk_t = torch.tensor([speaker_id], dtype=torch.long, device=device)
+    T_mel = energy_mel.shape[0]
+    train_len = cfg.segment_len
+    mel_hop = 512
+    output_sr = 44100
 
-    with torch.no_grad():
-        mel_gen, rough_mel = model.sample(
-            ppg_t, f0_t, energy_t, T_mel,
-            speaker_ids=spk_t,
-            dpm_steps=dpm_steps,
-            cfg_scale=cfg_scale_val,
-            device=device
-        )
-    mel_gen = mel_gen[0].cpu().float().numpy()
-    mel_gen = np.clip(mel_gen, SPEC_MIN, SPEC_MAX)
-    print(f"    Generated mel: {mel_gen.shape}, mean={mel_gen.mean():.3f} std={mel_gen.std():.3f} "
-          f"range=[{mel_gen.min():.3f}, {mel_gen.max():.3f}]")
-
-    if save_mel:
-        np.save(save_mel, mel_gen)
-        print(f"    Mel saved: {save_mel}")
-
-    # 6. HiFiGAN 声码器 → 音频
+    # Load HiFiGAN vocoder once
     print("  Loading HiFiGAN vocoder...")
     voc_cfg = config.get("vocoder", {})
-    model_path = voc_cfg.get("model", "Models/pc_nsf_hifigan/model.ckpt")
-    config_path = voc_cfg.get("config", "Models/pc_nsf_hifigan/config.json")
+    voc_model_path = voc_cfg.get("model", "Models/pc_nsf_hifigan/model.ckpt")
+    voc_config_path = voc_cfg.get("config", "Models/pc_nsf_hifigan/config.json")
     device_voc = voc_cfg.get("device", device)
-
-    if not os.path.isabs(model_path):
+    if not os.path.isabs(voc_model_path):
         base = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(base, model_path)
-        config_path = os.path.join(base, config_path)
+        voc_model_path = os.path.join(base, voc_model_path)
+        voc_config_path = os.path.join(base, voc_config_path)
+    hifigan = load_vocoder(voc_config_path, voc_model_path, device_voc)
 
-    hifigan = load_vocoder(config_path, model_path, device_voc)
-    uv_orig = f0 == 0
-    if uv_orig.any() and (~uv_orig).any():
-        f0_filled = f0.copy()
-        f0_filled[uv_orig] = np.interp(np.where(uv_orig)[0], np.where(~uv_orig)[0], f0[~uv_orig])
-        f0_melrate = np.interp(np.linspace(0, 1, T_mel), np.linspace(0, 1, len(f0_filled)), f0_filled)
-        uv_melrate = np.interp(np.linspace(0, 1, T_mel), np.linspace(0, 1, len(uv_orig.astype(float))),
-                               uv_orig.astype(float)) > 0.5
-        f0_melrate[uv_melrate] = 0.0
+    # Detect silent boundaries using already-loaded source audio
+    slicer = Slicer(sr=sr_src, threshold=-40, min_length=5000,
+                    min_interval=300, hop_size=10, max_sil_kept=500)
+    chunk_dict = slicer.slice(wav_src)
+
+    # Build ordered list of (start_sample, end_sample, is_silent)
+    seg_samples = []
+    for k in sorted(chunk_dict.keys(), key=int):
+        v = chunk_dict[k]
+        tag = v["split_time"].split(",")
+        s, e = int(tag[0]), int(tag[1])
+        if e > s:
+            seg_samples.append((s, e, v["slice"]))
+
+    if not seg_samples:
+        seg_samples = [(0, len(wav_src), False)]
+
+    total_wav_samples = len(wav_src)
+
+    # Convert sample boundaries → mel frame boundaries
+    seg_mel = []
+    for s, e, is_sil in seg_samples:
+        ms = int(s * T_mel / total_wav_samples)
+        me = int(e * T_mel / total_wav_samples)
+        if me > ms:
+            seg_mel.append((ms, me, is_sil))
+
+    if not seg_mel:
+        seg_mel = [(0, T_mel, False)]
+
+    print(f"  Sliced into {len(seg_mel)} segments by silence")
+
+    # Process each segment: model.sample → vocoder → collect audio
+    rope_scale_now = 1.0
+    seg_audio_pieces = []  # (output_sample_start, wav_array)
+    seg_mel_pieces = []    # (mel_start, mel_gen) for non-silent segments
+    current_sample = 0
+
+    for seg_idx, (mel_start, mel_end, is_silent) in enumerate(seg_mel):
+        seg_T = mel_end - mel_start
+        expected_sample_pos = mel_start * mel_hop
+
+        if is_silent:
+            silent_samples = seg_T * mel_hop
+            seg_audio_pieces.append((expected_sample_pos, np.zeros(silent_samples, dtype=np.float32)))
+            current_sample = expected_sample_pos + silent_samples
+            print(f"  Segment {seg_idx+1}/{len(seg_mel)}: silence {seg_T} frames")
+            continue
+
+        # Slice pre-extracted features to this segment
+        ppg_seg = ppg[int(mel_start * ppg.shape[0] / T_mel):int(mel_end * ppg.shape[0] / T_mel)]
+        f0_seg = f0[int(mel_start * len(f0) / T_mel):int(mel_end * len(f0) / T_mel)]
+        mel_seg = energy_mel[mel_start:mel_end]
+
+        # YaRN rope scale for this segment
+        if seg_T > train_len:
+            new_scale = seg_T / train_len
+        else:
+            new_scale = 1.0
+        if new_scale != rope_scale_now:
+            model.set_rope_scale(new_scale)
+            rope_scale_now = new_scale
+
+        print(f"  Segment {seg_idx+1}/{len(seg_mel)} ({seg_T} frames)...", end=" ")
+
+        ppg_t = torch.from_numpy(ppg_seg).float().unsqueeze(0).to(device)
+        f0_t = torch.from_numpy(f0_seg).float().unsqueeze(0).to(device)
+        energy_t = torch.from_numpy(mel_seg).float().unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            mel_gen_seg, _ = model.sample(
+                ppg_t, f0_t, energy_t, seg_T,
+                speaker_ids=spk_t, dpm_steps=dpm_steps,
+                cfg_scale=cfg_scale_val, device=device)
+        mel_gen_seg = mel_gen_seg[0].cpu().float().numpy()
+
+        mel_gen_seg = np.clip(mel_gen_seg, SPEC_MIN, SPEC_MAX)
+        seg_mel_pieces.append((mel_start, mel_gen_seg))
+        print(f"ok")
+
+        # Vocode this segment
+        uv_seg = f0_seg == 0
+        if uv_seg.any() and (~uv_seg).any():
+            f0_filled = f0_seg.copy()
+            f0_filled[uv_seg] = np.interp(np.where(uv_seg)[0], np.where(~uv_seg)[0], f0_seg[~uv_seg])
+            f0_mr = np.interp(np.linspace(0, 1, seg_T), np.linspace(0, 1, len(f0_filled)), f0_filled)
+            uv_mr = np.interp(np.linspace(0, 1, seg_T), np.linspace(0, 1, len(uv_seg.astype(float))),
+                              uv_seg.astype(float)) > 0.5
+            f0_mr[uv_mr] = 0.0
+        else:
+            f0_mr = np.interp(np.linspace(0, 1, seg_T), np.linspace(0, 1, len(f0_seg)), f0_seg)
+
+        wav_seg = vocode(mel_gen_seg, f0_mr, hifigan, device_voc)
+        seg_audio_pieces.append((expected_sample_pos, wav_seg))
+        current_sample = expected_sample_pos + len(wav_seg)
+
+    # 6. Cross-fade concatenate (DDSP-SVC style)
+    if len(seg_audio_pieces) == 1:
+        wav_out = seg_audio_pieces[0][1]
     else:
-        f0_melrate = np.interp(np.linspace(0, 1, T_mel), np.linspace(0, 1, len(f0)), f0)
-    wav_out = vocode(mel_gen, f0_melrate, hifigan, device_voc)
-    print(f"    Output: {len(wav_out)/44100:.1f}s @ 44100Hz")
+        result = np.zeros(0, dtype=np.float32)
+        cur_len = 0
+        for start_sample, wav_seg in seg_audio_pieces:
+            silent_len = start_sample - cur_len
+            if silent_len >= 0:
+                result = np.concatenate([result, np.zeros(silent_len, dtype=np.float32), wav_seg])
+            else:
+                result = cross_fade(result, wav_seg, cur_len + silent_len)
+            cur_len = start_sample + len(wav_seg)
+        wav_out = result
 
-    sf.write(output_audio, wav_out, 44100)
+    print(f"    Output: {len(wav_out)/output_sr:.1f}s @ {output_sr}Hz")
+
+    if save_mel:
+        if seg_mel_pieces:
+            full_mel_save = np.zeros((T_mel, 128), dtype=np.float32)
+            for mel_start, mel_gen_seg in seg_mel_pieces:
+                seg_T = mel_gen_seg.shape[0]
+                full_mel_save[mel_start:mel_start + seg_T] = mel_gen_seg
+            np.save(save_mel, full_mel_save)
+            print(f"    Mel saved: {save_mel}")
+        else:
+            print(f"    No mel to save (all segments are silent)")
+
+    sf.write(output_audio, wav_out, output_sr)
     print(f"  Saved: {output_audio}")
 
     return wav_out
