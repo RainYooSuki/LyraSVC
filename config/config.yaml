@@ -1,0 +1,95 @@
+# LyraSVC 歌声转换配置
+
+# ---- 特征提取 ----
+
+# PPG 特征提取 (Whisper Large v3 Turbo Encoder)
+ppg:
+  model: Models/whisper-large-v3-turbo
+  layer: 18               # Encoder 中间层 (0-31)
+  device: cuda:0
+
+# 音高提取 (RMVPE)
+pitch:
+  model: Models/rmvpe/model.pt
+  device: cuda:0
+  batch_size: 256         # GPU 批处理大小
+  num_workers: 0          # 音频加载并行线程数
+
+# Mel 谱提取 (训练目标)
+mel:
+  sample_rate: 44100
+  n_fft: 2048
+  hop_length: 512
+  n_mels: 128
+  fmin: 40
+  fmax: 16000
+
+# ---- 主模型 ----
+
+model:
+  ppg_dim: 1280                # Whisper encoder 输出维度
+  hidden_dim: 768              # DiT hidden dim (S:384, B:768, L:1024, XL:1152)
+  depth: 12                    # DiT blocks (S/B:12, L:24, XL:28)
+  num_heads: 12                # 注意力头数 (S:6, B:12, L/XL:16)
+  mlp_ratio: 4.0               # FFN 扩展比, 论文默认 4.0
+  mel_bins: 128                # Mel 频谱 bin 数, 需与 mel 提取参数一致
+  pitch_max_freq: 2000.0       # F0 编码频率上限 (Hz)
+  use_ref_spk: true            # 启用参考音频说话人编码
+  spec_min: -12.0              # Mel 值归一化下限 (dB)
+  spec_max: 5.0                # Mel 值归一化上限 (dB)
+  rough_decoder_hidden: 256    # RoughMelDecoder 内部隐层维度
+
+# ---- 扩散参数 (训练) ----
+
+diffusion:
+  timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  cfg_dropout_prob: 0.1
+
+# ---- 训练 ----
+
+train:
+  batch_size: 1
+  grad_accum: 1
+  segment_len: 384
+  num_workers: 0
+  preload: true                # 启动时全量加载到 RAM
+  epochs: 100000               # 最大epoch轮数
+  val_split: 0.1
+  optim: adamw                 # 优化器 (adamw)
+  optim_8bit: false            # 8-bit AdamW (需 pip install bitsandbytes)
+  precision: bf16              # 训练精度: fp32 | fp16 | bf16
+  learning_rate: 1.0e-5
+  weight_decay: 1.0e-6
+  beta1: 0.9
+  beta2: 0.999
+  grad_clip: 1.0
+  rough_loss_weight: 1.0       # RoughMel 辅助损失权重
+  warmup_steps: 1000
+  patience: 30                 # 连续 N 次验证 val_loss 不创新低即停
+  log_interval: 500
+  val_interval: 500            # 每 N 步验证一次
+  checkpoint_dir: checkpoints  # 模型保存目录
+
+# ---- 推理 ----
+
+inference:
+  dpm_steps: 20
+  cfg_scale: 1.5
+
+# ---- 声码器 ----
+
+vocoder:
+  model: Models/pc_nsf_hifigan/model.ckpt
+  config: Models/pc_nsf_hifigan/config.json
+  device: cuda:0
+
+# ---- 路径 ----
+
+data:
+  raw: data_raw
+  processed: data
+
+output:
+  audio: results

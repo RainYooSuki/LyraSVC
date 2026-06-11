@@ -1,0 +1,9 @@
+torch>=2.0
+numpy
+librosa
+soundfile
+pyyaml
+scipy
+torchaudio
+transformers
+# bitsandbytes
