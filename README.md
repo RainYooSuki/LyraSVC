@@ -34,7 +34,6 @@ LyraSVC/
 ├── train.py
 ├── infer.py
 ├── preprocess.py
-├── diagnose_inference.py
 └── README.md
 ```
 
@@ -100,4 +99,4 @@ python infer.py \
 
 ## License
 
-MIT
+[MIT](./LICENSE) 
