@@ -37,6 +37,7 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
         pitch_max_freq=cfg.pitch_max_freq,
         use_ref_spk=cfg.use_ref_spk,
         rough_decoder_hidden=cfg.rough_decoder_hidden,
+        content_dim=cfg.content_dim,
         segment_len=cfg.segment_len,
         spec_min=cfg.spec_min,
         spec_max=cfg.spec_max,

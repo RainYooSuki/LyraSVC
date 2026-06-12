@@ -47,7 +47,7 @@ class EMA(nn.Module):
 
 class DurationAwareContentEncoder(nn.Module):
     """PPG → linear upsample → mel frame-rate content features."""
-    def __init__(self, input_dim=1280, hidden_dim=256):
+    def __init__(self, input_dim=1280, hidden_dim=1280):
         super().__init__()
         self.pre_proj = nn.Conv1d(input_dim, hidden_dim, 1)
         self.post_conv = nn.Sequential(
@@ -171,7 +171,7 @@ class SpeakerEncoder(nn.Module):
 # ============================================================
 
 class RoughMelDecoder(nn.Module):
-    def __init__(self, content_dim=256, pitch_dim=64, hidden=256, mel_bins=128):
+    def __init__(self, content_dim=1280, pitch_dim=64, hidden=256, mel_bins=128):
         super().__init__()
         self.content_proj = nn.Linear(content_dim, hidden)
         self.pitch_proj = nn.Linear(pitch_dim, hidden)
@@ -445,6 +445,7 @@ class LyraModel(nn.Module):
         pitch_max_freq: float = 2000.0,
         use_ref_spk: bool = True,
         rough_decoder_hidden: int = 256,
+        content_dim: int = 1280,          # 内容编码器维度, 默认对齐 Whisper
         segment_len: int = 384,           # 训练段长, 用于 YaRN 外推基准
         spec_min: float = -12.0,
         spec_max: float = 5.0,
@@ -461,16 +462,16 @@ class LyraModel(nn.Module):
         self.spec_max = spec_max
 
         # --- Condition encoders (kept from original) ---
-        self.content_enc = DurationAwareContentEncoder(ppg_dim, 256)
+        self.content_enc = DurationAwareContentEncoder(ppg_dim, content_dim)
         self.pitch_enc = PitchEncoder(64, max_freq=pitch_max_freq)
         self.energy_enc = EnergyEncoder(32)
         self.speaker_enc = SpeakerEncoder(num_speakers, 256, use_ref_spk)
 
         # --- Rough mel decoder ---
-        self.rough_decoder = RoughMelDecoder(256, 64, rough_decoder_hidden, mel_bins)
+        self.rough_decoder = RoughMelDecoder(content_dim, 64, rough_decoder_hidden, mel_bins)
 
         # --- Condition injection projections (to hidden_dim) ---
-        self.content_inject = nn.Linear(256, hidden_dim)
+        self.content_inject = nn.Linear(content_dim, hidden_dim)
         self.pitch_inject = nn.Linear(64, hidden_dim)
         self.energy_inject = nn.Linear(32, hidden_dim)
         self.speaker_inject = nn.Linear(256, hidden_dim)
@@ -716,6 +717,7 @@ class ModelConfig:
     pitch_max_freq: float = 2000.0
     use_ref_spk: bool = True
     rough_decoder_hidden: int = 256
+    content_dim: int = 1280
     spec_min: float = -12.0
     spec_max: float = 5.0
     diffusion_timesteps: int = 1000
@@ -757,6 +759,7 @@ class ModelConfig:
             spec_min=m.get("spec_min", -12.0),
             spec_max=m.get("spec_max", 5.0),
             rough_decoder_hidden=m.get("rough_decoder_hidden", 256),
+            content_dim=m.get("content_dim", 1280),
             diffusion_timesteps=d.get("timesteps", 1000),
             diffusion_beta_start=d.get("beta_start", 0.0001),
             diffusion_beta_end=d.get("beta_end", 0.02),

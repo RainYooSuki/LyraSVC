@@ -276,6 +276,7 @@ def train(resume_from=None):
         pitch_max_freq=m_cfg.get("pitch_max_freq", 2000.0),
         use_ref_spk=m_cfg.get("use_ref_spk", True),
         rough_decoder_hidden=m_cfg.get("rough_decoder_hidden", 256),
+        content_dim=m_cfg.get("content_dim", 1280),
         segment_len=segment_len,
         spec_min=m_cfg.get("spec_min", -12.0),
         spec_max=m_cfg.get("spec_max", 5.0),

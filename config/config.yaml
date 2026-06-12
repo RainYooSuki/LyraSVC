@@ -38,6 +38,7 @@ model:
   spec_min: -12.0              # Mel 值归一化下限 (dB)
   spec_max: 5.0                # Mel 值归一化上限 (dB)
   rough_decoder_hidden: 256    # RoughMelDecoder 内部隐层维度
+  content_dim: 1280              # 内容编码器维度
 
 # ---- 扩散参数 (训练) ----
 
