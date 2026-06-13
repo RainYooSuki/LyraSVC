@@ -331,6 +331,16 @@ def train(resume_from=None):
                         'scaler_state_dict', 'ema_shadow']:
                 ckpt.pop(key, None)
 
+        # 删除 rough_decoder 旧权重 (维度变化时自动适配)
+        rough_keys = [k for k in ckpt.get('model_state_dict', {}).keys() if k.startswith('rough_decoder.')]
+        for k in rough_keys:
+            ckpt['model_state_dict'].pop(k, None)
+        if rough_keys:
+            print(f"  RoughMelDecoder dim changed, reinitializing from scratch")
+            for key in ['optimizer_state_dict', 'scheduler_state_dict',
+                        'scaler_state_dict', 'ema_shadow']:
+                ckpt.pop(key, None)
+
         model.load_state_dict(ckpt['model_state_dict'], strict=False)
 
         if 'optimizer_state_dict' in ckpt:
@@ -450,6 +460,7 @@ def train(resume_from=None):
                 improved = False
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    best_recon = val_recon
                     improved = True
                     torch.save(checkpoint_dict, os.path.join(checkpoint_dir, "best.pt"))
                     torch.save({'model_state_dict': ema.shadow, 'speakers': speakers},
@@ -460,6 +471,7 @@ def train(resume_from=None):
                     improved = True
                     print(f"    -> new best recon={val_recon:.4f}")
 
+                scheduler.step(val_loss)
                 patience_counter = 0 if improved else patience_counter + 1
                 if patience_counter >= patience:
                     print(f"\n  Early stopping: val_loss no improvement for {patience} validations (step {global_step})")

@@ -152,13 +152,11 @@ def convert(
     if not seg_samples:
         seg_samples = [(0, len(wav_src), False)]
 
-    total_wav_samples = len(wav_src)
-
     # Convert sample boundaries → mel frame boundaries
     seg_mel = []
     for s, e, is_sil in seg_samples:
-        ms = int(s * T_mel / total_wav_samples)
-        me = int(e * T_mel / total_wav_samples)
+        ms = s // mel_hop
+        me = e // mel_hop
         if me > ms:
             seg_mel.append((ms, me, is_sil))
 
