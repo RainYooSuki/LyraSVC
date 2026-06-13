@@ -159,7 +159,7 @@ def mel_sisnr(gt, pred):
     val = 10 * torch.log10((s_target ** 2).sum(1) / (e_noise ** 2).sum(1).clamp(min=eps) + eps)
     return val.mean().item()
 
-def run_validation(model, val_loader, device, use_amp, amp_dtype, rough_weight, dpm_steps):
+def run_validation(model, val_loader, device, use_amp, amp_dtype, dpm_steps):
     model.eval()
     val_loss = 0.0
     val_recon = 0.0
@@ -172,13 +172,12 @@ def run_validation(model, val_loader, device, use_amp, amp_dtype, rough_weight, 
             f0 = batch['f0'].to(device)
             mel = batch['mel'].to(device)
             spk = batch['speaker_id'].to(device)
-            eps_loss, rough_loss, _, _ = model.train_loss(mel, ppg, f0, energy_mel=mel, speaker_ids=spk)
-            total_loss = rough_weight * rough_loss + eps_loss
-            val_loss += total_loss.item()
+            eps_loss, _, _ = model.train_loss(mel, ppg, f0, energy_mel=mel, speaker_ids=spk)
+            val_loss += eps_loss.item()
 
             B = mel.shape[0]
             T_mel = mel.shape[1]
-            gen_mel, _ = model.sample(ppg, f0, mel, T_mel, speaker_ids=spk,
+            gen_mel = model.sample(ppg, f0, mel, T_mel, speaker_ids=spk,
                                       dpm_steps=dpm_steps, cfg_scale=1.0, device=device)
             gt = mel.clamp(-12, 5)
             pred = gen_mel.clamp(-12, 5)
@@ -231,7 +230,6 @@ def train(resume_from=None):
     beta1 = t_cfg.get("beta1", 0.9)
     beta2 = t_cfg.get("beta2", 0.999)
     grad_clip = t_cfg.get("grad_clip", 1.0)
-    rough_weight = t_cfg.get("rough_loss_weight", 1.0)
     dpm_steps = inf_cfg.get("dpm_steps", 20)
     log_interval = t_cfg.get("log_interval", 500)
     val_interval = t_cfg.get("val_interval", 500)
@@ -275,7 +273,6 @@ def train(resume_from=None):
         mel_bins=m_cfg.get("mel_bins", 128),
         pitch_max_freq=m_cfg.get("pitch_max_freq", 2000.0),
         use_ref_spk=m_cfg.get("use_ref_spk", True),
-        rough_decoder_hidden=m_cfg.get("rough_decoder_hidden", 256),
         content_dim=m_cfg.get("content_dim", 1280),
         segment_len=segment_len,
         spec_min=m_cfg.get("spec_min", -12.0),
@@ -331,8 +328,8 @@ def train(resume_from=None):
                         'scaler_state_dict', 'ema_shadow']:
                 ckpt.pop(key, None)
 
-        # 删除 rough_decoder 旧权重 (维度变化时自动适配)
-        rough_keys = [k for k in ckpt.get('model_state_dict', {}).keys() if k.startswith('rough_decoder.')]
+        # 删除 rough_decoder 旧权重 (已废弃)
+        rough_keys = [k for k in ckpt.get('model_state_dict', {}).keys() if k.startswith('rough_decoder.') or k.startswith('rough_mel_inject.')]
         for k in rough_keys:
             ckpt['model_state_dict'].pop(k, None)
         if rough_keys:
@@ -387,10 +384,10 @@ def train(resume_from=None):
 
             amp_ctx = torch.autocast("cuda", dtype=amp_dtype) if use_amp else nullcontext()
             with amp_ctx:
-                eps_loss, rough_loss, _, _ = model.train_loss(
+                eps_loss, _, _ = model.train_loss(
                     mel, ppg, f0, energy_mel=mel, speaker_ids=spk
                 )
-                total_loss = rough_weight * rough_loss + eps_loss
+                total_loss = eps_loss
                 loss = total_loss / grad_accum
 
             if use_amp:
@@ -439,7 +436,7 @@ def train(resume_from=None):
             # --- Step-based validation ---
             if global_step > 0 and global_step % val_interval == 0 and global_step >= warmup_steps:
                 val_loss, val_recon, val_snr, val_psnr, val_sisnr = run_validation(
-                    model, val_loader, device, use_amp, amp_dtype, rough_weight, dpm_steps)
+                    model, val_loader, device, use_amp, amp_dtype, dpm_steps)
                 elapsed = time.time() - epoch_start
                 print(f"  Step {global_step:5d} | loss: {val_loss:.4f} | recon: {val_recon:.3f} | "
                       f"SNR: {val_snr:.1f} | PSNR: {val_psnr:.1f} | SI-SNR: {val_sisnr:.1f} | "

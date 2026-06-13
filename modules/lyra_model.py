@@ -167,33 +167,7 @@ class SpeakerEncoder(nn.Module):
 
 
 # ============================================================
-# 2. RoughMelDecoder (zero-init output)
-# ============================================================
-
-class RoughMelDecoder(nn.Module):
-    def __init__(self, content_dim=1280, pitch_dim=64, hidden=256, mel_bins=128):
-        super().__init__()
-        self.content_proj = nn.Linear(content_dim, hidden)
-        self.pitch_proj = nn.Linear(pitch_dim, hidden)
-        self.convs = nn.Sequential(
-            nn.Conv1d(hidden, hidden, 3, padding=1), nn.GroupNorm(8, hidden), nn.SiLU(),
-            nn.Conv1d(hidden, hidden, 3, padding=1), nn.GroupNorm(8, hidden), nn.SiLU(),
-            nn.Conv1d(hidden, hidden, 3, padding=1), nn.GroupNorm(8, hidden), nn.SiLU(),
-            nn.Conv1d(hidden, mel_bins, 3, padding=1),
-        )
-        nn.init.zeros_(self.convs[-1].weight)
-        nn.init.zeros_(self.convs[-1].bias)
-
-    def forward(self, content, pitch):
-        x = self.content_proj(content) + self.pitch_proj(pitch)
-        x = x.transpose(1, 2)
-        x = self.convs(x)
-        x = x.transpose(1, 2)
-        return x.clamp(-12.0, 5.0)
-
-
-# ============================================================
-# 3. DDPM 噪声调度与扩散
+# 2. DDPM 噪声调度与扩散
 # ============================================================
 
 def extract(a, t, x_shape):
@@ -444,7 +418,6 @@ class LyraModel(nn.Module):
         mel_bins: int = 128,
         pitch_max_freq: float = 2000.0,
         use_ref_spk: bool = True,
-        rough_decoder_hidden: int = 256,
         content_dim: int = 1280,          # 内容编码器维度, 默认对齐 Whisper
         segment_len: int = 384,           # 训练段长, 用于 YaRN 外推基准
         spec_min: float = -12.0,
@@ -467,15 +440,11 @@ class LyraModel(nn.Module):
         self.energy_enc = EnergyEncoder(32)
         self.speaker_enc = SpeakerEncoder(num_speakers, 256, use_ref_spk)
 
-        # --- Rough mel decoder ---
-        self.rough_decoder = RoughMelDecoder(content_dim, 64, rough_decoder_hidden, mel_bins)
-
         # --- Condition injection projections (to hidden_dim) ---
         self.content_inject = nn.Linear(content_dim, hidden_dim)
         self.pitch_inject = nn.Linear(64, hidden_dim)
         self.energy_inject = nn.Linear(32, hidden_dim)
         self.speaker_inject = nn.Linear(256, hidden_dim)
-        self.rough_mel_inject = nn.Linear(mel_bins, hidden_dim)
 
         # --- DiT components ---
         self.x_embedder = nn.Linear(mel_bins, hidden_dim)
@@ -564,7 +533,7 @@ class LyraModel(nn.Module):
         speaker_ids: Optional[torch.Tensor] = None,
         ref_mel: Optional[torch.Tensor] = None,
         force_uncond: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         B, T, _ = x.shape
 
         # 1. Encode conditions
@@ -580,30 +549,26 @@ class LyraModel(nn.Module):
         if speaker_raw is None:
             speaker_raw = torch.zeros(B, T, 256, device=x.device)
 
-        # 2. Rough mel (condition)
-        rough_mel = self.rough_decoder(content, pitch)
-
-        # 3. Build per-frame condition vector
+        # 2. Build per-frame condition vector
         cond_inj = (
             self.content_inject(content)
             + self.pitch_inject(pitch)
             + self.energy_inject(energy)
             + self.speaker_inject(speaker_raw)
-            + self.rough_mel_inject(rough_mel)
         )
 
-        # 4. Timestep embedding
+        # 3. Timestep embedding
         t_emb = self.t_embedder(t)
 
-        # 5. Speaker label embedding (for CFG)
+        # 4. Speaker label embedding (for CFG)
         force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
         spk_emb = self.y_embedder(speaker_ids, self.training, force_drop_ids=force_drop)
 
-        # 6. Combine: c = t + spk + cond_summary
+        # 5. Combine: c = t + spk + cond_summary
         cond_summary = cond_inj.mean(dim=1)
         c = t_emb + spk_emb + cond_summary
 
-        # 7. DiT forward
+        # 6. DiT forward
         x = self.x_embedder(x)
         x = x + cond_inj
 
@@ -611,7 +576,7 @@ class LyraModel(nn.Module):
             x = block(x, c)
 
         x = self.final_layer(x, c)
-        return x, rough_mel
+        return x
 
     def train_loss(self, mel_real, ppg, f0, energy_mel, speaker_ids=None, ref_mel=None):
         B = mel_real.shape[0]
@@ -621,11 +586,10 @@ class LyraModel(nn.Module):
         noise = torch.randn_like(mel_real_n)
         x_noisy = self.q_sample(mel_real_n, t, noise)
 
-        eps_pred, rough_mel = self(x_noisy, t, ppg, f0, energy_mel, speaker_ids, ref_mel)
+        eps_pred = self(x_noisy, t, ppg, f0, energy_mel, speaker_ids, ref_mel)
 
         eps_loss = F.mse_loss(eps_pred, noise)
-        rough_loss = F.mse_loss(rough_mel, mel_real.clamp(SPEC_MIN, SPEC_MAX))
-        return eps_loss, rough_loss, eps_pred, noise
+        return eps_loss, eps_pred, noise
 
     @torch.no_grad()
     def sample(
@@ -639,7 +603,7 @@ class LyraModel(nn.Module):
         dpm_steps: int = 20,
         cfg_scale: float = 1.5,
         device: str = "cuda",
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         B = ppg.shape[0]
         T_mel = length
 
@@ -651,11 +615,9 @@ class LyraModel(nn.Module):
         elif energy.shape[1] < T_mel:
             energy = F.pad(energy, (0, 0, 0, T_mel - energy.shape[1]))
 
-        rough_mel = self.rough_decoder(content, pitch)
-
         cond_inj = (
             self.content_inject(content) + self.pitch_inject(pitch)
-            + self.energy_inject(energy) + self.rough_mel_inject(rough_mel)
+            + self.energy_inject(energy)
         )
 
         speaker_raw = self.speaker_enc(speaker_ids, ref_mel, T_mel)
@@ -698,7 +660,7 @@ class LyraModel(nn.Module):
             order=2, skip_type="time_uniform", method="multistep",
         )
 
-        return denorm_spec(mel), rough_mel
+        return denorm_spec(mel)
 
 
 # ============================================================
@@ -716,7 +678,6 @@ class ModelConfig:
     mel_bins: int = 128
     pitch_max_freq: float = 2000.0
     use_ref_spk: bool = True
-    rough_decoder_hidden: int = 256
     content_dim: int = 1280
     spec_min: float = -12.0
     spec_max: float = 5.0
@@ -724,7 +685,6 @@ class ModelConfig:
     diffusion_beta_start: float = 0.0001
     diffusion_beta_end: float = 0.02
     cfg_dropout_prob: float = 0.1
-    rough_loss_weight: float = 1.0
     dpm_steps: int = 20
     cfg_scale: float = 1.5
     learning_rate: float = 1e-4
@@ -758,13 +718,11 @@ class ModelConfig:
             use_ref_spk=m.get("use_ref_spk", True),
             spec_min=m.get("spec_min", -12.0),
             spec_max=m.get("spec_max", 5.0),
-            rough_decoder_hidden=m.get("rough_decoder_hidden", 256),
             content_dim=m.get("content_dim", 1280),
             diffusion_timesteps=d.get("timesteps", 1000),
             diffusion_beta_start=d.get("beta_start", 0.0001),
             diffusion_beta_end=d.get("beta_end", 0.02),
             cfg_dropout_prob=m.get("cfg_dropout_prob", 0.1),
-            rough_loss_weight=t.get("rough_loss_weight", 1.0),
             learning_rate=t.get("learning_rate", 1e-4),
             dpm_steps=inf.get("dpm_steps", 20),
             cfg_scale=inf.get("cfg_scale", 1.5),
@@ -788,7 +746,6 @@ if __name__ == "__main__":
         mel_bins=cfg.mel_bins,
         pitch_max_freq=cfg.pitch_max_freq,
         use_ref_spk=cfg.use_ref_spk,
-        rough_decoder_hidden=cfg.rough_decoder_hidden,
         diffusion_timesteps=cfg.diffusion_timesteps,
         beta_start=cfg.diffusion_beta_start,
         beta_end=cfg.diffusion_beta_end,
@@ -802,14 +759,13 @@ if __name__ == "__main__":
     mel_real = torch.randn(B, T_mel, 128).cuda()
     t = torch.randint(0, model.timesteps, (B,)).cuda()
 
-    eps, rough = model(mel_real, t, ppg, f0, energy_mel=mel_real)
+    eps = model(mel_real, t, ppg, f0, energy_mel=mel_real)
     print(f"Epsilon shape: {eps.shape}")
-    print(f"Rough mel shape: {rough.shape}")
 
-    eps_loss, rough_loss, _, _ = model.train_loss(
+    eps_loss, _, _ = model.train_loss(
         mel_real, ppg, f0, energy_mel=mel_real
     )
-    print(f"Eps loss: {eps_loss.item():.4f}, Rough loss: {rough_loss.item():.4f}")
+    print(f"Eps loss: {eps_loss.item():.4f}")
 
     params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Params: {params:.1f}M")

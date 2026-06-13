@@ -37,7 +37,6 @@ model:
   use_ref_spk: true            # 启用参考音频说话人编码
   spec_min: -12.0              # Mel 值归一化下限 (dB)
   spec_max: 5.0                # Mel 值归一化上限 (dB)
-  rough_decoder_hidden: 768    # RoughMelDecoder 内部隐层维度
   content_dim: 1280            # 内容编码器维度
 
 # ---- 扩散参数 (训练) ----
@@ -66,7 +65,6 @@ train:
   beta1: 0.9
   beta2: 0.999
   grad_clip: 1.0
-  rough_loss_weight: 1.0       # RoughMel 辅助损失权重
   warmup_steps: 1000
   patience: 30                 # 连续 N 次验证 val_loss 不创新低即停
   log_interval: 500

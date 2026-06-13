@@ -36,7 +36,6 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
         mel_bins=cfg.mel_bins,
         pitch_max_freq=cfg.pitch_max_freq,
         use_ref_spk=cfg.use_ref_spk,
-        rough_decoder_hidden=cfg.rough_decoder_hidden,
         content_dim=cfg.content_dim,
         segment_len=cfg.segment_len,
         spec_min=cfg.spec_min,
@@ -203,7 +202,7 @@ def convert(
         energy_t = torch.from_numpy(mel_seg).float().unsqueeze(0).to(device)
 
         with torch.no_grad():
-            mel_gen_seg, _ = model.sample(
+            mel_gen_seg = model.sample(
                 ppg_t, f0_t, energy_t, seg_T,
                 speaker_ids=spk_t, dpm_steps=dpm_steps,
                 cfg_scale=cfg_scale_val, device=device)
