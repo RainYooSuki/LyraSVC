@@ -31,14 +31,14 @@ model:
   hidden_dim: 768              # DiT hidden dim (S:384, B:768, L:1024, XL:1152)
   depth: 12                    # DiT blocks (S/B:12, L:24, XL:28)
   num_heads: 12                # 注意力头数 (S:6, B:12, L/XL:16)
-  mlp_ratio: 4.0               # FFN 扩展比, 论文默认 4.0
+  mlp_ratio: 4.0               # FFN 扩展比
   mel_bins: 128                # Mel 频谱 bin 数, 需与 mel 提取参数一致
   pitch_max_freq: 2000.0       # F0 编码频率上限 (Hz)
   use_ref_spk: true            # 启用参考音频说话人编码
   spec_min: -12.0              # Mel 值归一化下限 (dB)
   spec_max: 5.0                # Mel 值归一化上限 (dB)
-  rough_decoder_hidden: 256    # RoughMelDecoder 内部隐层维度
-  content_dim: 1280              # 内容编码器维度
+  rough_decoder_hidden: 768    # RoughMelDecoder 内部隐层维度
+  content_dim: 1280            # 内容编码器维度
 
 # ---- 扩散参数 (训练) ----
 
