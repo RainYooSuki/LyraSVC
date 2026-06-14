@@ -1,5 +1,5 @@
 """
-LyraSVC
+LyraSVC Model Base
 """
 
 import math

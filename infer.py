@@ -61,10 +61,6 @@ def load_model(checkpoint_path: str, device: str = "cuda", model_type: str = Non
         beta_end=cfg.diffusion_beta_end,
         cfg_dropout_prob=cfg.cfg_dropout_prob,
     )
-    if model_type == "turbo":
-        model_kwargs["n_content_anchors"] = m_cfg.get("n_content_anchors", 16)
-        model_kwargs["n_pitch_anchors"] = m_cfg.get("n_pitch_anchors", 16)
-        model_kwargs["n_energy_anchors"] = m_cfg.get("n_energy_anchors", 16)
     model = LyraModel(**model_kwargs).to(device)
 
     # 推理用 EMA 权重 (如果存在)

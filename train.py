@@ -295,10 +295,6 @@ def train(resume_from=None, model_type=None):
         beta_end=d_cfg.get("beta_end", 0.02),
         cfg_dropout_prob=d_cfg.get("cfg_dropout_prob", 0.1),
     )
-    if model_type == "turbo":
-        model_kwargs["n_content_anchors"] = m_cfg.get("n_content_anchors", 16)
-        model_kwargs["n_pitch_anchors"] = m_cfg.get("n_pitch_anchors", 16)
-        model_kwargs["n_energy_anchors"] = m_cfg.get("n_energy_anchors", 16)
     model = LyraModel(**model_kwargs).to(device)
 
     use_8bit = t_cfg.get("optim_8bit", False)

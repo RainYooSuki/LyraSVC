@@ -325,9 +325,13 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
-            self.adaLN_modulation(c).chunk(6, dim=1)
+            self.adaLN_modulation(c).chunk(6, dim=-1)
 
-        x_norm = self.norm1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        if c.dim() == 2:
+            scale_msa, shift_msa, gate_msa = scale_msa.unsqueeze(1), shift_msa.unsqueeze(1), gate_msa.unsqueeze(1)
+            scale_mlp, shift_mlp, gate_mlp = scale_mlp.unsqueeze(1), shift_mlp.unsqueeze(1), gate_mlp.unsqueeze(1)
+
+        x_norm = self.norm1(x) * (1 + scale_msa) + shift_msa
         B, N, D = x_norm.shape
         qkv = self.qkv(x_norm).reshape(B, N, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
@@ -341,10 +345,10 @@ class TransformerBlock(nn.Module):
 
         attn = F.scaled_dot_product_attention(q, k, v)
         attn = attn.permute(0, 2, 1, 3).reshape(B, N, D)
-        x = x + gate_msa.unsqueeze(1) * self.proj(attn)
+        x = x + gate_msa * self.proj(attn)
 
-        x_norm = self.norm2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-        x = x + gate_mlp.unsqueeze(1) * self.w2(F.silu(self.w1(x_norm)) * self.w3(x_norm))
+        x_norm = self.norm2(x) * (1 + scale_mlp) + shift_mlp
+        x = x + gate_mlp * self.w2(F.silu(self.w1(x_norm)) * self.w3(x_norm))
         return x
 
 
@@ -419,8 +423,10 @@ class FinalLayer(nn.Module):
         )
 
     def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        if c.dim() == 2:
+            shift, scale = shift.unsqueeze(1), scale.unsqueeze(1)
+        x = self.norm(x) * (1 + scale) + shift
         return self.linear(x)
 
 
@@ -492,27 +498,7 @@ class ModelConfig:
 
 
 # ============================================================
-# Anchor Pooler
-# ============================================================
-
-class AnchorPooler(nn.Module):
-    def __init__(self, n_anchors: int):
-        super().__init__()
-        self.n_anchors = n_anchors
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
-        if T < self.n_anchors:
-            x = F.pad(x.permute(0, 2, 1), (0, self.n_anchors - T), mode='replicate').permute(0, 2, 1)
-            T = self.n_anchors
-        x = x.permute(0, 2, 1)
-        x = F.adaptive_avg_pool1d(x, self.n_anchors)
-        x = x.permute(0, 2, 1)
-        return x
-
-
-# ============================================================
-# LyraModelTurbo
+# LyraModelTurbo — 逐帧 adaLN
 # ============================================================
 
 class LyraModelTurbo(nn.Module):
@@ -535,9 +521,6 @@ class LyraModelTurbo(nn.Module):
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
         cfg_dropout_prob: float = 0.1,
-        n_content_anchors: int = 16,
-        n_pitch_anchors: int = 16,
-        n_energy_anchors: int = 16,
     ):
         super().__init__()
         self.mel_bins = mel_bins
@@ -546,36 +529,30 @@ class LyraModelTurbo(nn.Module):
         self.spec_min = spec_min
         self.spec_max = spec_max
         self.segment_len = segment_len
-        self.n_content_anchors = n_content_anchors
-        self.n_pitch_anchors = n_pitch_anchors
-        self.n_energy_anchors = n_energy_anchors
 
         self.content_enc = DurationAwareContentEncoder(ppg_dim, content_dim)
         self.pitch_enc = PitchEncoder(64, max_freq=pitch_max_freq)
         self.energy_enc = EnergyEncoder(32)
         self.speaker_enc = SpeakerEncoder(num_speakers, 256, use_ref_spk)
 
-        self.content_pool = AnchorPooler(n_content_anchors)
-        self.pitch_pool = AnchorPooler(n_pitch_anchors)
-        self.energy_pool = AnchorPooler(n_energy_anchors)
+        # Per-frame condition projections (no pooling)
+        self.content_frame_proj = nn.Linear(content_dim, hidden_dim)
+        self.pitch_frame_proj = nn.Linear(64, hidden_dim)
+        self.energy_frame_proj = nn.Linear(32, hidden_dim)
+        self.speaker_frame_proj = nn.Linear(256, hidden_dim)
 
-        self.content_anchor_proj = nn.Linear(content_dim, hidden_dim)
-        self.pitch_anchor_proj = nn.Linear(64, hidden_dim)
-        self.energy_anchor_proj = nn.Linear(32, hidden_dim)
-        self.speaker_anchor_proj = nn.Linear(256, hidden_dim)
         self.mel_token = nn.Linear(mel_bins, hidden_dim)
 
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.y_embedder = LabelEmbedder(num_speakers, hidden_dim, cfg_dropout_prob)
 
-        total_train_tokens = n_content_anchors + n_pitch_anchors + n_energy_anchors + 1 + segment_len
         head_dim = hidden_dim // num_heads
         self.rotary_emb = RotaryPositionEmbedding(
             dim=head_dim,
             max_pos=16384,
             base=10000.0,
             scale=1.0,
-            original_max_pos=total_train_tokens,
+            original_max_pos=segment_len,
         )
 
         self.blocks = nn.ModuleList([
@@ -624,13 +601,12 @@ class LyraModelTurbo(nn.Module):
     def set_rope_scale(self, scale: float):
         old = self.rotary_emb
         head_dim = self.hidden_dim // self.blocks[0].n_heads
-        total_train = self.n_content_anchors + self.n_pitch_anchors + self.n_energy_anchors + 1 + self.segment_len
         new_rotary = RotaryPositionEmbedding(
             dim=head_dim,
             max_pos=16384,
             base=old.base,
             scale=scale,
-            original_max_pos=total_train,
+            original_max_pos=self.segment_len,
             extrapolation_factor=old.extrapolation_factor,
             attn_factor=old.attn_factor,
             beta_fast=old.beta_fast,
@@ -641,6 +617,7 @@ class LyraModelTurbo(nn.Module):
             block.rotary_emb = new_rotary
 
     def _build_tokens(self, x, ppg, f0, energy_mel, speaker_ids, ref_mel):
+        """Encode conditions → per-frame projection + mel tokens."""
         B, T_mel, _ = x.shape
 
         content, _ = self.content_enc(ppg, T_mel)
@@ -655,19 +632,14 @@ class LyraModelTurbo(nn.Module):
         if speaker is None:
             speaker = torch.zeros(B, T_mel, 256, device=x.device)
 
-        c_anchors = self.content_pool(content)
-        p_anchors = self.pitch_pool(pitch)
-        e_anchors = self.energy_pool(energy)
-        s_anchor = speaker.mean(dim=1, keepdim=True)
+        # Per-frame condition → adaLN bias (no pooling)
+        c_frame = (self.content_frame_proj(content) +
+                   self.pitch_frame_proj(pitch) +
+                   self.energy_frame_proj(energy) +
+                   self.speaker_frame_proj(speaker))
 
-        c_tokens = self.content_anchor_proj(c_anchors)
-        p_tokens = self.pitch_anchor_proj(p_anchors)
-        e_tokens = self.energy_anchor_proj(e_anchors)
-        s_tokens = self.speaker_anchor_proj(s_anchor)
-        m_tokens = self.mel_token(x)
-
-        tokens = torch.cat([c_tokens, p_tokens, e_tokens, s_tokens, m_tokens], dim=1)
-        return tokens
+        m_tokens = self.mel_token(x)  # (B, T_mel, D)
+        return m_tokens, c_frame
 
     def q_sample(self, x_start, t, noise):
         a = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
@@ -687,18 +659,17 @@ class LyraModelTurbo(nn.Module):
     ) -> torch.Tensor:
         B, T_mel, _ = x.shape
 
-        tokens = self._build_tokens(x, ppg, f0, energy_mel, speaker_ids, ref_mel)
+        tokens, c_frame = self._build_tokens(x, ppg, f0, energy_mel, speaker_ids, ref_mel)
 
         t_emb = self.t_embedder(t)
         force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
         spk_emb = self.y_embedder(speaker_ids, self.training, force_drop_ids=force_drop)
-        c = t_emb + spk_emb
+        c = t_emb.unsqueeze(1) + spk_emb.unsqueeze(1) + c_frame  # (B, T_mel, D)
 
         for block in self.blocks:
             tokens = block(tokens, c)
 
         out = self.final_layer(tokens, c)
-        out = out[:, -T_mel:, :]
         return out
 
     def train_loss(self, mel_real, ppg, f0, energy_mel, speaker_ids=None, ref_mel=None):
@@ -730,8 +701,9 @@ class LyraModelTurbo(nn.Module):
         B = ppg.shape[0]
         T_mel = length
 
-        def _make_condition_tokens(x):
-            return self._build_tokens(x, ppg, f0, energy_mel, speaker_ids, ref_mel)
+        # Pre-build condition frame (content/pitch/energy/speaker don't change per DPM step)
+        dummy_mel = torch.zeros(B, T_mel, self.mel_bins, device=device)
+        _, c_frame_static = self._build_tokens(dummy_mel, ppg, f0, energy_mel, speaker_ids, ref_mel)
 
         from modules.dpm_solver import NoiseScheduleVP, DPM_Solver
 
@@ -741,16 +713,17 @@ class LyraModelTurbo(nn.Module):
             t_discrete = (t_continuous - 1.0 / self.timesteps) * self.timesteps
 
             def _forward(x, t_d, force_uncond):
-                tokens = _make_condition_tokens(x)
+                m_tokens = self.mel_token(x)
                 t_emb = self.t_embedder(t_d)
                 force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
                 spk_emb = self.y_embedder(speaker_ids, False, force_drop_ids=force_drop)
-                c = t_emb + spk_emb
+                c = t_emb.unsqueeze(1) + spk_emb.unsqueeze(1) + c_frame_static
 
+                tokens = m_tokens
                 for block in self.blocks:
                     tokens = block(tokens, c)
                 out = self.final_layer(tokens, c)
-                return out[:, -T_mel:, :]
+                return out
 
             if cfg_scale != 1.0:
                 eps_cond = _forward(x, t_discrete, force_uncond=False)

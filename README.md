@@ -3,8 +3,8 @@
 基于 **S³-DiT (Scalable Single-Stream Diffusion Transformer) + DDPM** 的歌声转换系统。将源音频的内容、音高、能量特征与目标说话人音色通过单流 Transformer 联合建模，扩散生成目标 Mel 频谱，再经 HiFiGAN 声码器还原为高质量音频。
 
 提供两种架构：
-- **Base** — S³-DiT 完整单流
-- **Turbo** — 条件池化为少量全局锚点，mel 保留逐帧分辨率
+- **Base** — S³-DiT 帧交织单流
+- **Turbo** — 逐帧 adaLN 注入 + mel self-attention
 
 ## 工作流程
 
@@ -95,9 +95,9 @@ python train.py --resume checkpoints/latest.pt
 训练过程会输出验证指标：
 - **SNR / PSNR / SI-SNR** — 重建质量
 - **fcorr** — 生成 mel 与源的逐帧能量相关性 (0→1, 越高越好)
-- **csens** — 打乱 PPG 后输出变化量 (衡量条件编码是否生效)
+- **csens** — 打乱 PPG 后输出变化量
 - **spot (T=384)** — 训练段评估
-- **full (T=...）** — 完整段评估 (测试 YaRN 长序列外推)
+- **full (T=...）** — 完整段评估
 
 ### 4. 推理
 
@@ -111,13 +111,6 @@ python infer.py \
 
 # 保存中间 mel (调试用)
 python infer.py ... --save-mel test_mel.npy
-```
-
-### 5. 诊断
-
-```bash
-python diagnose_inference.py   # 推理 pipeline 诊断
-python vocoder_direct_test.py  # 声码器独立测试
 ```
 
 ## 致谢
