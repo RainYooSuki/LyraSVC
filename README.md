@@ -1,19 +1,22 @@
 # LyraSVC — Singing Voice Conversion
 
-基于 **DiT (Diffusion Transformer) + DDPM** 的歌声转换系统。将源音频的内容、音高、能量特征与目标说话人音色结合，通过扩散模型生成目标 Mel 频谱，再经 HiFiGAN 声码器还原为高质量音频。
+基于 **S³-DiT (Scalable Single-Stream Diffusion Transformer) + DDPM** 的歌声转换系统。将源音频的内容、音高、能量特征与目标说话人音色通过单流 Transformer 联合建模，扩散生成目标 Mel 频谱，再经 HiFiGAN 声码器还原为高质量音频。
+
+提供两种架构：
+- **Base** — S³-DiT 完整单流
+- **Turbo** — 条件池化为少量全局锚点，mel 保留逐帧分辨率
 
 ## 工作流程
 
 ```
 训练:
   源音频 → Whisper(PPG) + RMVPE(F0) + nvSTFT(Mel)
-       → 条件编码 → RoughMelDecoder(粗mel)
-       → DDPM 加噪 → DiT 预测噪声 ε → MSE Loss
+        → 条件编码 → DDPM 加噪 → DiT 预测噪声 ε → MSE Loss
 
 推理:
-  源音频 → 提取 PPG/F0/Mel
-       → Randn 噪声 + 条件 → DPM-Solver++ 20步去噪
-       → denorm → HiFiGAN → 音频波形
+  源音频 → 提取 PPG/F0/Mel → Slicer 静音切片
+        → 每段 Randn 噪声 + 条件 → DPM-Solver++ 20步去噪
+        → denorm → HiFiGAN → cross-fade 拼接 → 音频波形
 ```
 
 ## 项目结构
@@ -21,19 +24,21 @@
 ```
 LyraSVC/
 ├── config/
-│   └── config.yaml
+│   └── config.yaml                # 统一配置 (architecture, 训练, 推理)
 ├── modules/
-│   ├── lyra_model.py            # 主模型 (DiT + DDPM + RoughMelDecoder)
-│   ├── dpm_solver.py            # DPM-Solver++ ODE 求解器
-│   ├── vocoder.py               # NSF-HiFiGAN 声码器
-│   ├── mel.py                   # Mel 谱提取
-│   ├── pitch.py                 # F0 提取 (RMVPE)
-│   ├── whisper_ppg.py           # Whisper PPG 特征提取
-│   ├── nvSTFT.py                # STFT + Mel 底层实现
-│   └── rmvpe/                   # RMVPE 模型
-├── train.py
-├── infer.py
-├── preprocess.py
+│   ├── lyra_model.py              # Base 模型 (S3DiT 单流 + DDPM)
+│   ├── lyra_model_turbo.py        # Turbo 模型 (锚点压缩, 独立文件)
+│   ├── dpm_solver.py              # DPM-Solver++ ODE 求解器
+│   ├── slicer.py                  # 静音切片 + cross-fade
+│   ├── vocoder.py                 # NSF-HiFiGAN 声码器
+│   ├── mel.py                     # Mel 谱提取 (nvSTFT)
+│   ├── pitch.py                   # F0 提取 (RMVPE)
+│   ├── whisper_ppg.py             # Whisper PPG 特征提取
+│   ├── nvSTFT.py                  # STFT + Mel 底层实现
+│   └── rmvpe/                     # RMVPE 模型
+├── train.py                       # 训练脚本 (支持 --model base/turbo)
+├── infer.py                       # 推理脚本 (支持 --model base/turbo)
+├── preprocess.py                  # 一键预处理
 └── README.md
 ```
 
@@ -45,9 +50,9 @@ LyraSVC/
 
 ```
 Models/
-├── whisper-large-v3-turbo/      # Whisper 编码器
-├── rmvpe/model.pt                # RMVPE 音高提取
-└── pc_nsf_hifigan/               # HiFiGAN 声码器
+├── whisper-large-v3-turbo/        # Whisper 编码器
+├── rmvpe/model.pt                 # RMVPE 音高提取
+└── pc_nsf_hifigan/                # HiFiGAN 声码器
 ```
 
 ### 1. 准备数据
@@ -69,12 +74,30 @@ python preprocess.py
 
 ### 3. 训练
 
+配置 `config/config.yaml` 中的 `architecture` 选择模型：
+
+```yaml
+model:
+  architecture: turbo    # base 或 turbo
+```
+
 ```bash
+# 使用 config 中指定的架构
 python train.py
+
+# 命令行覆盖架构
+python train.py --model turbo
 
 # 中断后恢复
 python train.py --resume checkpoints/latest.pt
 ```
+
+训练过程会输出验证指标：
+- **SNR / PSNR / SI-SNR** — 重建质量
+- **fcorr** — 生成 mel 与源的逐帧能量相关性 (0→1, 越高越好)
+- **csens** — 打乱 PPG 后输出变化量 (衡量条件编码是否生效)
+- **spot (T=384)** — 训练段评估
+- **full (T=...）** — 完整段评估 (测试 YaRN 长序列外推)
 
 ### 4. 推理
 
@@ -83,7 +106,18 @@ python infer.py \
     --source data_raw/<speaker>/input.wav \
     --output results/output.wav \
     --checkpoint checkpoints/best_ema.pt \
-    --speaker 0
+    --speaker 0 \
+    --model turbo
+
+# 保存中间 mel (调试用)
+python infer.py ... --save-mel test_mel.npy
+```
+
+### 5. 诊断
+
+```bash
+python diagnose_inference.py   # 推理 pipeline 诊断
+python vocoder_direct_test.py  # 声码器独立测试
 ```
 
 ## 致谢
@@ -91,12 +125,11 @@ python infer.py \
 本项目受益于以下优秀开源工作：
 
 - **[DiffSinger](https://github.com/openvpi/DiffSinger)** — DDPM 扩散框架与 DPM-Solver++ 求解器
-- **[DDSP-SVC](https://github.com/yxlllc/DDSP-SVC)** — 条件注入模式
+- **[DDSP-SVC](https://github.com/yxlllc/DDSP-SVC)** — Slicer 切片 + 条件注入模式
 - **[ReFlow-VAE-SVC](https://github.com/yxlllc/ReFlow-VAE-SVC)** — nvSTFT Mel 提取实现
-- **[DiT (Facebook Research)](https://github.com/facebookresearch/DiT)** — Diffusion Transformer 架构
 - **[Whisper (OpenAI)](https://github.com/openai/whisper)** — 内容特征编码
 - **[RMVPE](https://github.com/Dream-High/RMVPE)** — 音高提取
 
 ## License
 
-[MIT](./LICENSE) 
+[MIT](./LICENSE)

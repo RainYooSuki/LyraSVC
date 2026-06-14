@@ -1,11 +1,11 @@
 """
-LyraSVC Model — DDPM Diffusion + Single-Stream Transformer Backbone
-===================================================================
-Architecture:
-  1. Condition Encoders: Content, Pitch, Energy, Speaker
-  2. Single-stream transformer: all modalities concatenated in sequence
-  3. adaLN-Zero Transformer blocks with fused QKV, QK-Norm, SwiGLU
-  4. DDPM epsilon-prediction training + DPM-Solver++ sampling with CFG
+LyraSVC Turbo — Anchor-compressed conditions + Mel self-attention
+==================================================================
+- Content/Pitch/Energy pooled to 16 anchor tokens each
+- Speaker pooled to 1 token
+- Mel keeps per-frame resolution (384 frames)
+- Total: 49 + T_mel ≈ 433 tokens (vs 1920 in base S3DiT)
+- Standalone file, no dependency on lyra_model.py
 """
 
 import math
@@ -19,11 +19,10 @@ from copy import deepcopy
 
 
 # ============================================================
-# 0. EMA class
+# EMA
 # ============================================================
 
 class EMA(nn.Module):
-    """Exponential Moving Average: maintains a shadow copy of model weights."""
     def __init__(self, model: nn.Module, decay: float = 0.999):
         super().__init__()
         self.decay = decay
@@ -41,11 +40,10 @@ class EMA(nn.Module):
 
 
 # ============================================================
-# 1. Condition Encoders
+# Condition Encoders
 # ============================================================
 
 class DurationAwareContentEncoder(nn.Module):
-    """PPG -> linear upsample -> mel frame-rate content features."""
     def __init__(self, input_dim=1280, hidden_dim=1280):
         super().__init__()
         self.pre_proj = nn.Conv1d(input_dim, hidden_dim, 1)
@@ -64,7 +62,7 @@ class DurationAwareContentEncoder(nn.Module):
         x = F.interpolate(x, size=target_len, mode='linear')
         x = self.post_conv(x)
         x = x.transpose(1, 2)
-        return x, torch.zeros(ppg.shape[0], ppg.shape[1], device=ppg.device)
+        return x, torch.zeros(ppg.shape[0], target_len, device=ppg.device)
 
 
 class ContinuousFreqEmbed(nn.Module):
@@ -166,7 +164,7 @@ class SpeakerEncoder(nn.Module):
 
 
 # ============================================================
-# 2. DDPM helpers
+# DDPM helpers
 # ============================================================
 
 def extract(a, t, x_shape):
@@ -176,7 +174,7 @@ def extract(a, t, x_shape):
 
 
 # ============================================================
-# 3. Spec normalization helpers
+# Spec normalization
 # ============================================================
 
 SPEC_MIN, SPEC_MAX = -12.0, 5.0
@@ -192,7 +190,7 @@ def denorm_spec(x):
 
 
 # ============================================================
-# 4. YaRN Rotary Position Embedding
+# YaRN Rotary Position Embedding
 # ============================================================
 
 def rotate_half(x):
@@ -200,24 +198,29 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
+
 def apply_rotary_pos_emb(q, k, cos, sin):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+
 def _yarn_find_correction_dim(num_rotations, dim, base, max_pos):
     return (dim * math.log(max_pos / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
 
 def _yarn_find_correction_range(low_rot, high_rot, dim, base, max_pos):
     low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_pos))
     high = math.ceil(_yarn_find_correction_dim(high_rot, dim, base, max_pos))
     return max(low, 0), min(high, dim - 1)
 
+
 def _yarn_linear_ramp_mask(min_val, max_val, dim):
     if min_val == max_val:
         max_val += 0.001
     linear = (torch.arange(dim, dtype=torch.float32) - min_val) / (max_val - min_val)
     return torch.clamp(linear, 0, 1)
+
 
 def _yarn_get_mscale(scale=1.0):
     if scale <= 1:
@@ -282,7 +285,7 @@ class RotaryPositionEmbedding(nn.Module):
 
 
 # ============================================================
-# 5. RMSNorm
+# RMSNorm
 # ============================================================
 
 class RMSNorm(nn.Module):
@@ -297,11 +300,10 @@ class RMSNorm(nn.Module):
 
 
 # ============================================================
-# 6. Transformer block
+# Transformer block
 # ============================================================
 
 class TransformerBlock(nn.Module):
-    """Single-stream transformer block with fused QKV, QK-Norm, and RMSNorm."""
     def __init__(self, dim, n_heads=12, ffn_mult=4):
         super().__init__()
         self.n_heads = n_heads
@@ -331,7 +333,6 @@ class TransformerBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
             self.adaLN_modulation(c).chunk(6, dim=1)
 
-        # Attention path
         x_norm = self.norm1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         B, N, D = x_norm.shape
         qkv = self.qkv(x_norm).reshape(B, N, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -348,14 +349,13 @@ class TransformerBlock(nn.Module):
         attn = attn.permute(0, 2, 1, 3).reshape(B, N, D)
         x = x + gate_msa.unsqueeze(1) * self.proj(attn)
 
-        # FFN path (SwiGLU)
         x_norm = self.norm2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
         x = x + gate_mlp.unsqueeze(1) * self.w2(F.silu(self.w1(x_norm)) * self.w3(x_norm))
         return x
 
 
 # ============================================================
-# 7. Timestep & Label embedders
+# Timestep & Label embedders
 # ============================================================
 
 class TimestepEmbedder(nn.Module):
@@ -411,7 +411,7 @@ class LabelEmbedder(nn.Module):
 
 
 # ============================================================
-# 8. FinalLayer
+# FinalLayer
 # ============================================================
 
 class FinalLayer(nn.Module):
@@ -431,280 +431,7 @@ class FinalLayer(nn.Module):
 
 
 # ============================================================
-# 9. LyraModel — DDPM diffusion + Single-Stream Transformer
-# ============================================================
-
-class LyraModel(nn.Module):
-    def __init__(
-        self,
-        num_speakers: int = 1,
-        ppg_dim: int = 1280,
-        hidden_dim: int = 1024,
-        depth: int = 12,
-        num_heads: int = 16,
-        mlp_ratio: float = 4.0,
-        mel_bins: int = 128,
-        pitch_max_freq: float = 2000.0,
-        use_ref_spk: bool = True,
-        content_dim: int = 1280,
-        segment_len: int = 384,
-        spec_min: float = -12.0,
-        spec_max: float = 5.0,
-        diffusion_timesteps: int = 1000,
-        beta_start: float = 0.0001,
-        beta_end: float = 0.02,
-        cfg_dropout_prob: float = 0.1,
-    ):
-        super().__init__()
-        self.mel_bins = mel_bins
-        self.hidden_dim = hidden_dim
-        self.timesteps = diffusion_timesteps
-        self.spec_min = spec_min
-        self.spec_max = spec_max
-
-        # --- Condition encoders ---
-        self.content_enc = DurationAwareContentEncoder(ppg_dim, content_dim)
-        self.pitch_enc = PitchEncoder(64, max_freq=pitch_max_freq)
-        self.energy_enc = EnergyEncoder(32)
-        self.speaker_enc = SpeakerEncoder(num_speakers, 256, use_ref_spk)
-
-        # --- Timestep and label embedders ---
-        self.t_embedder = TimestepEmbedder(hidden_dim)
-        self.y_embedder = LabelEmbedder(num_speakers, hidden_dim, cfg_dropout_prob)
-
-        # --- YaRN RoPE ---
-        # S3-DiT concatenates 5 modalities in a single stream: total seq_len = 5 * T_mel
-        head_dim = hidden_dim // num_heads
-        self.segment_len = segment_len
-        self.rotary_emb = RotaryPositionEmbedding(
-            dim=head_dim,
-            max_pos=16384,
-            base=10000.0,
-            scale=1.0,
-            original_max_pos=segment_len * 5,
-        )
-
-        # --- Token projections for each modality ---
-        self.content_token = nn.Linear(content_dim, hidden_dim)
-        self.pitch_token = nn.Linear(64, hidden_dim)
-        self.energy_token = nn.Linear(32, hidden_dim)
-        self.speaker_token = nn.Linear(256, hidden_dim)
-        self.mel_token = nn.Linear(mel_bins, hidden_dim)
-
-        # --- Learnable modality embeddings ---
-        self.modal_embed = nn.Parameter(torch.zeros(1, 5, hidden_dim))
-        nn.init.normal_(self.modal_embed, std=0.02)
-
-        # --- Transformer blocks ---
-        self.blocks = nn.ModuleList([
-            TransformerBlock(hidden_dim, num_heads, ffn_mult=mlp_ratio)
-            for _ in range(depth)
-        ])
-        for block in self.blocks:
-            block.rotary_emb = self.rotary_emb
-
-        self.final_layer = FinalLayer(hidden_dim, mel_bins)
-
-        # --- Build noise schedule ---
-        self._build_noise_schedule(diffusion_timesteps, beta_start, beta_end)
-
-        # --- Weight initialization ---
-        self._init_weights()
-
-    def _build_noise_schedule(self, timesteps, beta_start, beta_end):
-        betas = np.linspace(beta_start, beta_end, timesteps, dtype=np.float64)
-        alphas = 1.0 - betas
-        alphas_cumprod = np.cumprod(alphas, axis=0)
-        self.register_buffer('betas', torch.from_numpy(betas).float())
-        self.register_buffer('alphas_cumprod', torch.from_numpy(alphas_cumprod).float())
-        self.register_buffer('sqrt_alphas_cumprod', torch.from_numpy(np.sqrt(alphas_cumprod)).float())
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.from_numpy(np.sqrt(1 - alphas_cumprod)).float())
-
-    def _init_weights(self):
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-
-        self.apply(_basic_init)
-
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
-
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def set_rope_scale(self, scale: float):
-        head_dim = self.hidden_dim // self.blocks[0].n_heads
-        old = self.rotary_emb
-        new_rotary = RotaryPositionEmbedding(
-            dim=head_dim,
-            max_pos=16384,
-            base=old.base,
-            scale=scale,
-            original_max_pos=self.segment_len * 5,
-            extrapolation_factor=old.extrapolation_factor,
-            attn_factor=old.attn_factor,
-            beta_fast=old.beta_fast,
-            beta_slow=old.beta_slow,
-        ).to(next(self.parameters()).device)
-        self.rotary_emb = new_rotary
-        for block in self.blocks:
-            block.rotary_emb = new_rotary
-
-    def q_sample(self, x_start, t, noise):
-        a = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
-        b = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
-        return a * x_start + b * noise
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        ppg: torch.Tensor,
-        f0: torch.Tensor,
-        energy_mel: torch.Tensor,
-        speaker_ids: Optional[torch.Tensor] = None,
-        ref_mel: Optional[torch.Tensor] = None,
-        force_uncond: bool = False,
-    ) -> torch.Tensor:
-        B, T_mel, _ = x.shape
-
-        # 1. Encode conditions
-        content, _ = self.content_enc(ppg, T_mel)
-        pitch, _ = self.pitch_enc(f0, T_mel)
-        energy = self.energy_enc(energy_mel)
-        if energy.shape[1] > T_mel:
-            energy = energy[:, :T_mel]
-        elif energy.shape[1] < T_mel:
-            energy = F.pad(energy, (0, 0, 0, T_mel - energy.shape[1]))
-
-        speaker = self.speaker_enc(speaker_ids, ref_mel, T_mel)
-        if speaker is None:
-            speaker = torch.zeros(B, T_mel, 256, device=x.device)
-
-        # 2. Tokenize each modality
-        mel_tokens = self.mel_token(x) + self.modal_embed[:, 0:1, :]
-        content_tokens = self.content_token(content) + self.modal_embed[:, 1:2, :]
-        pitch_tokens = self.pitch_token(pitch) + self.modal_embed[:, 2:3, :]
-        energy_tokens = self.energy_token(energy) + self.modal_embed[:, 3:4, :]
-        speaker_tokens = self.speaker_token(speaker) + self.modal_embed[:, 4:5, :]
-
-        # 3. Frame-interleaved concatenation: [c0,p0,e0,s0,m0, c1,p1,e1,s1,m1, ...]
-        tokens = torch.stack([content_tokens, pitch_tokens, energy_tokens,
-                              speaker_tokens, mel_tokens], dim=2).reshape(B, T_mel * 5, self.hidden_dim)
-
-        # 4. Timestep and speaker embedding for adaLN
-        t_emb = self.t_embedder(t)
-        force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
-        spk_emb = self.y_embedder(speaker_ids, self.training, force_drop_ids=force_drop)
-        c = t_emb + spk_emb
-
-        # 5. Transformer blocks
-        for block in self.blocks:
-            tokens = block(tokens, c)
-
-        # 6. Output only mel portion (modality index 4 in interleaved layout)
-        out = self.final_layer(tokens, c)
-        out = out[:, 4::5, :]  # every 5th token starting at index 4
-        return out
-
-    def train_loss(self, mel_real, ppg, f0, energy_mel, speaker_ids=None, ref_mel=None):
-        B = mel_real.shape[0]
-        mel_real_n = norm_spec(mel_real.clamp(SPEC_MIN, SPEC_MAX))
-
-        t = torch.randint(0, self.timesteps, (B,), device=mel_real.device)
-        noise = torch.randn_like(mel_real_n)
-        x_noisy = self.q_sample(mel_real_n, t, noise)
-
-        eps_pred = self(x_noisy, t, ppg, f0, energy_mel, speaker_ids, ref_mel)
-
-        eps_loss = F.mse_loss(eps_pred, noise)
-        return eps_loss, eps_pred, noise
-
-    @torch.no_grad()
-    def sample(
-        self,
-        ppg: torch.Tensor,
-        f0: torch.Tensor,
-        energy_mel: torch.Tensor,
-        length: int,
-        speaker_ids: Optional[torch.Tensor] = None,
-        ref_mel: Optional[torch.Tensor] = None,
-        dpm_steps: int = 20,
-        cfg_scale: float = 1.5,
-        device: str = "cuda",
-    ) -> torch.Tensor:
-        B = ppg.shape[0]
-        T_mel = length
-
-        content, _ = self.content_enc(ppg, T_mel)
-        pitch, _ = self.pitch_enc(f0, T_mel)
-        energy = self.energy_enc(energy_mel)
-        if energy.shape[1] > T_mel:
-            energy = energy[:, :T_mel]
-        elif energy.shape[1] < T_mel:
-            energy = F.pad(energy, (0, 0, 0, T_mel - energy.shape[1]))
-
-        speaker = self.speaker_enc(speaker_ids, ref_mel, T_mel)
-        if speaker is None:
-            speaker = torch.zeros(B, T_mel, 256, device=device)
-
-        content_t = self.content_token(content) + self.modal_embed[:, 1:2, :]
-        pitch_t = self.pitch_token(pitch) + self.modal_embed[:, 2:3, :]
-        energy_t = self.energy_token(energy) + self.modal_embed[:, 3:4, :]
-        speaker_t = self.speaker_token(speaker) + self.modal_embed[:, 4:5, :]
-
-        from modules.dpm_solver import NoiseScheduleVP, DPM_Solver
-
-        noise_schedule = NoiseScheduleVP(schedule='discrete', betas=self.betas)
-
-        def model_fn(x, t_continuous):
-            t_discrete = (t_continuous - 1.0 / self.timesteps) * self.timesteps
-
-            def _forward(x, t_d, force_uncond):
-                t_emb = self.t_embedder(t_d)
-                force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
-                spk_emb = self.y_embedder(speaker_ids, False, force_drop_ids=force_drop)
-                c = t_emb + spk_emb
-
-                mel_t = self.mel_token(x) + self.modal_embed[:, 0:1, :]
-                tokens = torch.stack([content_t, pitch_t, energy_t, speaker_t, mel_t], dim=2).reshape(B, T_mel * 5, self.hidden_dim)
-                for block in self.blocks:
-                    tokens = block(tokens, c)
-                out = self.final_layer(tokens, c)
-                return out[:, 4::5, :]
-
-            if cfg_scale != 1.0:
-                eps_cond = _forward(x, t_discrete, force_uncond=False)
-                eps_uncond = _forward(x, t_discrete, force_uncond=True)
-                return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
-            else:
-                return _forward(x, t_discrete, force_uncond=False)
-
-        dpm_solver = DPM_Solver(model_fn, noise_schedule, algorithm_type="dpmsolver++")
-
-        x_T = torch.randn(B, T_mel, self.mel_bins, device=device)
-
-        mel = dpm_solver.sample(
-            x_T, steps=dpm_steps,
-            order=2, skip_type="time_uniform", method="multistep",
-        )
-
-        return denorm_spec(mel)
-
-
-# ============================================================
-# 10. ModelConfig
+# ModelConfig
 # ============================================================
 
 @dataclass
@@ -771,12 +498,293 @@ class ModelConfig:
 
 
 # ============================================================
-# 11. Quick test
+# Anchor Pooler
+# ============================================================
+
+class AnchorPooler(nn.Module):
+    def __init__(self, n_anchors: int):
+        super().__init__()
+        self.n_anchors = n_anchors
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        if T < self.n_anchors:
+            x = F.pad(x.permute(0, 2, 1), (0, self.n_anchors - T), mode='replicate').permute(0, 2, 1)
+            T = self.n_anchors
+        x = x.permute(0, 2, 1)
+        x = F.adaptive_avg_pool1d(x, self.n_anchors)
+        x = x.permute(0, 2, 1)
+        return x
+
+
+# ============================================================
+# LyraModelTurbo
+# ============================================================
+
+class LyraModelTurbo(nn.Module):
+    def __init__(
+        self,
+        num_speakers: int = 1,
+        ppg_dim: int = 1280,
+        hidden_dim: int = 1024,
+        depth: int = 12,
+        num_heads: int = 16,
+        mlp_ratio: float = 4.0,
+        mel_bins: int = 128,
+        pitch_max_freq: float = 2000.0,
+        use_ref_spk: bool = True,
+        content_dim: int = 1280,
+        segment_len: int = 384,
+        spec_min: float = -12.0,
+        spec_max: float = 5.0,
+        diffusion_timesteps: int = 1000,
+        beta_start: float = 0.0001,
+        beta_end: float = 0.02,
+        cfg_dropout_prob: float = 0.1,
+        n_content_anchors: int = 16,
+        n_pitch_anchors: int = 16,
+        n_energy_anchors: int = 16,
+    ):
+        super().__init__()
+        self.mel_bins = mel_bins
+        self.hidden_dim = hidden_dim
+        self.timesteps = diffusion_timesteps
+        self.spec_min = spec_min
+        self.spec_max = spec_max
+        self.segment_len = segment_len
+        self.n_content_anchors = n_content_anchors
+        self.n_pitch_anchors = n_pitch_anchors
+        self.n_energy_anchors = n_energy_anchors
+
+        self.content_enc = DurationAwareContentEncoder(ppg_dim, content_dim)
+        self.pitch_enc = PitchEncoder(64, max_freq=pitch_max_freq)
+        self.energy_enc = EnergyEncoder(32)
+        self.speaker_enc = SpeakerEncoder(num_speakers, 256, use_ref_spk)
+
+        self.content_pool = AnchorPooler(n_content_anchors)
+        self.pitch_pool = AnchorPooler(n_pitch_anchors)
+        self.energy_pool = AnchorPooler(n_energy_anchors)
+
+        self.content_anchor_proj = nn.Linear(content_dim, hidden_dim)
+        self.pitch_anchor_proj = nn.Linear(64, hidden_dim)
+        self.energy_anchor_proj = nn.Linear(32, hidden_dim)
+        self.speaker_anchor_proj = nn.Linear(256, hidden_dim)
+        self.mel_token = nn.Linear(mel_bins, hidden_dim)
+
+        self.t_embedder = TimestepEmbedder(hidden_dim)
+        self.y_embedder = LabelEmbedder(num_speakers, hidden_dim, cfg_dropout_prob)
+
+        total_train_tokens = n_content_anchors + n_pitch_anchors + n_energy_anchors + 1 + segment_len
+        head_dim = hidden_dim // num_heads
+        self.rotary_emb = RotaryPositionEmbedding(
+            dim=head_dim,
+            max_pos=16384,
+            base=10000.0,
+            scale=1.0,
+            original_max_pos=total_train_tokens,
+        )
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(hidden_dim, num_heads, ffn_mult=mlp_ratio)
+            for _ in range(depth)
+        ])
+        for block in self.blocks:
+            block.rotary_emb = self.rotary_emb
+
+        self.final_layer = FinalLayer(hidden_dim, mel_bins)
+
+        self._build_noise_schedule(diffusion_timesteps, beta_start, beta_end)
+        self._init_weights()
+
+    def _build_noise_schedule(self, timesteps, beta_start, beta_end):
+        betas = np.linspace(beta_start, beta_end, timesteps, dtype=np.float64)
+        alphas = 1.0 - betas
+        alphas_cumprod = np.cumprod(alphas, axis=0)
+        self.register_buffer('betas', torch.from_numpy(betas).float())
+        self.register_buffer('alphas_cumprod', torch.from_numpy(alphas_cumprod).float())
+        self.register_buffer('sqrt_alphas_cumprod', torch.from_numpy(np.sqrt(alphas_cumprod)).float())
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.from_numpy(np.sqrt(1 - alphas_cumprod)).float())
+
+    def _init_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+        self.apply(_basic_init)
+
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def set_rope_scale(self, scale: float):
+        old = self.rotary_emb
+        head_dim = self.hidden_dim // self.blocks[0].n_heads
+        total_train = self.n_content_anchors + self.n_pitch_anchors + self.n_energy_anchors + 1 + self.segment_len
+        new_rotary = RotaryPositionEmbedding(
+            dim=head_dim,
+            max_pos=16384,
+            base=old.base,
+            scale=scale,
+            original_max_pos=total_train,
+            extrapolation_factor=old.extrapolation_factor,
+            attn_factor=old.attn_factor,
+            beta_fast=old.beta_fast,
+            beta_slow=old.beta_slow,
+        ).to(next(self.parameters()).device)
+        self.rotary_emb = new_rotary
+        for block in self.blocks:
+            block.rotary_emb = new_rotary
+
+    def _build_tokens(self, x, ppg, f0, energy_mel, speaker_ids, ref_mel):
+        B, T_mel, _ = x.shape
+
+        content, _ = self.content_enc(ppg, T_mel)
+        pitch, _ = self.pitch_enc(f0, T_mel)
+        energy = self.energy_enc(energy_mel)
+        if energy.shape[1] > T_mel:
+            energy = energy[:, :T_mel]
+        elif energy.shape[1] < T_mel:
+            energy = F.pad(energy, (0, 0, 0, T_mel - energy.shape[1]))
+
+        speaker = self.speaker_enc(speaker_ids, ref_mel, T_mel)
+        if speaker is None:
+            speaker = torch.zeros(B, T_mel, 256, device=x.device)
+
+        c_anchors = self.content_pool(content)
+        p_anchors = self.pitch_pool(pitch)
+        e_anchors = self.energy_pool(energy)
+        s_anchor = speaker.mean(dim=1, keepdim=True)
+
+        c_tokens = self.content_anchor_proj(c_anchors)
+        p_tokens = self.pitch_anchor_proj(p_anchors)
+        e_tokens = self.energy_anchor_proj(e_anchors)
+        s_tokens = self.speaker_anchor_proj(s_anchor)
+        m_tokens = self.mel_token(x)
+
+        tokens = torch.cat([c_tokens, p_tokens, e_tokens, s_tokens, m_tokens], dim=1)
+        return tokens
+
+    def q_sample(self, x_start, t, noise):
+        a = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+        b = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+        return a * x_start + b * noise
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        ppg: torch.Tensor,
+        f0: torch.Tensor,
+        energy_mel: torch.Tensor,
+        speaker_ids: Optional[torch.Tensor] = None,
+        ref_mel: Optional[torch.Tensor] = None,
+        force_uncond: bool = False,
+    ) -> torch.Tensor:
+        B, T_mel, _ = x.shape
+
+        tokens = self._build_tokens(x, ppg, f0, energy_mel, speaker_ids, ref_mel)
+
+        t_emb = self.t_embedder(t)
+        force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
+        spk_emb = self.y_embedder(speaker_ids, self.training, force_drop_ids=force_drop)
+        c = t_emb + spk_emb
+
+        for block in self.blocks:
+            tokens = block(tokens, c)
+
+        out = self.final_layer(tokens, c)
+        out = out[:, -T_mel:, :]
+        return out
+
+    def train_loss(self, mel_real, ppg, f0, energy_mel, speaker_ids=None, ref_mel=None):
+        B = mel_real.shape[0]
+        mel_real_n = norm_spec(mel_real.clamp(SPEC_MIN, SPEC_MAX))
+
+        t = torch.randint(0, self.timesteps, (B,), device=mel_real.device)
+        noise = torch.randn_like(mel_real_n)
+        x_noisy = self.q_sample(mel_real_n, t, noise)
+
+        eps_pred = self(x_noisy, t, ppg, f0, energy_mel, speaker_ids, ref_mel)
+
+        eps_loss = F.mse_loss(eps_pred, noise)
+        return eps_loss, eps_pred, noise
+
+    @torch.no_grad()
+    def sample(
+        self,
+        ppg: torch.Tensor,
+        f0: torch.Tensor,
+        energy_mel: torch.Tensor,
+        length: int,
+        speaker_ids: Optional[torch.Tensor] = None,
+        ref_mel: Optional[torch.Tensor] = None,
+        dpm_steps: int = 20,
+        cfg_scale: float = 1.5,
+        device: str = "cuda",
+    ) -> torch.Tensor:
+        B = ppg.shape[0]
+        T_mel = length
+
+        def _make_condition_tokens(x):
+            return self._build_tokens(x, ppg, f0, energy_mel, speaker_ids, ref_mel)
+
+        from modules.dpm_solver import NoiseScheduleVP, DPM_Solver
+
+        noise_schedule = NoiseScheduleVP(schedule='discrete', betas=self.betas)
+
+        def model_fn(x, t_continuous):
+            t_discrete = (t_continuous - 1.0 / self.timesteps) * self.timesteps
+
+            def _forward(x, t_d, force_uncond):
+                tokens = _make_condition_tokens(x)
+                t_emb = self.t_embedder(t_d)
+                force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
+                spk_emb = self.y_embedder(speaker_ids, False, force_drop_ids=force_drop)
+                c = t_emb + spk_emb
+
+                for block in self.blocks:
+                    tokens = block(tokens, c)
+                out = self.final_layer(tokens, c)
+                return out[:, -T_mel:, :]
+
+            if cfg_scale != 1.0:
+                eps_cond = _forward(x, t_discrete, force_uncond=False)
+                eps_uncond = _forward(x, t_discrete, force_uncond=True)
+                return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+            else:
+                return _forward(x, t_discrete, force_uncond=False)
+
+        dpm_solver = DPM_Solver(model_fn, noise_schedule, algorithm_type="dpmsolver++")
+
+        x_T = torch.randn(B, T_mel, self.mel_bins, device=device)
+
+        mel = dpm_solver.sample(
+            x_T, steps=dpm_steps,
+            order=2, skip_type="time_uniform", method="multistep",
+        )
+
+        return denorm_spec(mel)
+
+
+# ============================================================
+# Quick test
 # ============================================================
 
 if __name__ == "__main__":
+    print("LyraModelTurbo smoke test")
     cfg = ModelConfig.from_yaml()
-    model = LyraModel(
+    model = LyraModelTurbo(
         num_speakers=cfg.num_speakers,
         ppg_dim=cfg.ppg_dim,
         hidden_dim=cfg.hidden_dim,
@@ -788,12 +796,16 @@ if __name__ == "__main__":
         use_ref_spk=cfg.use_ref_spk,
         content_dim=cfg.content_dim,
         segment_len=cfg.segment_len,
+        spec_min=cfg.spec_min,
+        spec_max=cfg.spec_max,
         diffusion_timesteps=cfg.diffusion_timesteps,
         beta_start=cfg.diffusion_beta_start,
         beta_end=cfg.diffusion_beta_end,
         cfg_dropout_prob=cfg.cfg_dropout_prob,
     )
     model.cuda()
+    params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"  params: {params:.1f}M")
 
     B, T_ppg, T_f0, T_mel = 1, 30, 200, 170
     ppg = torch.randn(B, T_ppg, cfg.ppg_dim).cuda()
@@ -803,12 +815,12 @@ if __name__ == "__main__":
     spk_ids = torch.zeros(B, dtype=torch.long).cuda()
 
     eps = model(mel_real, t, ppg, f0, energy_mel=mel_real, speaker_ids=spk_ids)
-    print(f"Epsilon shape: {eps.shape}")
+    print(f"  forward eps shape: {eps.shape} (expected: {B, T_mel, 128})")
 
-    eps_loss, _, _ = model.train_loss(
-        mel_real, ppg, f0, energy_mel=mel_real, speaker_ids=spk_ids
-    )
-    print(f"Eps loss: {eps_loss.item():.4f}")
+    eps_loss, _, _ = model.train_loss(mel_real, ppg, f0, energy_mel=mel_real, speaker_ids=spk_ids)
+    print(f"  train_loss: {eps_loss.item():.4f}")
 
-    params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Params: {params:.1f}M")
+    gen = model.sample(ppg, f0, mel_real, T_mel, speaker_ids=spk_ids, dpm_steps=4, cfg_scale=1.0, device="cuda")
+    print(f"  sample shape: {gen.shape} (expected: {B, T_mel, 128})")
+    print(f"  gen mean/std: {gen.mean().item():.2f}/{gen.std().item():.2f}")
+    print("  OK")

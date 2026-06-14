@@ -27,6 +27,7 @@ mel:
 # ---- 主模型 ----
 
 model:
+  architecture: base           # base/turbo
   ppg_dim: 1280                # Whisper encoder 输出维度
   hidden_dim: 768              # DiT hidden dim (S:384, B:768, L:1024, XL:1152)
   depth: 12                    # DiT blocks (S/B:12, L:24, XL:28)

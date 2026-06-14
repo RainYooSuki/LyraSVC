@@ -13,7 +13,7 @@ import numpy as np
 import librosa
 import soundfile as sf
 
-from modules.lyra_model import LyraModel, ModelConfig, SPEC_MIN, SPEC_MAX
+from modules.lyra_model import LyraModel as LyraModelBase, ModelConfig, SPEC_MIN, SPEC_MAX
 from modules.slicer import Slicer, cross_fade
 from modules.whisper_ppg import WhisperPPGExtractor
 from modules.pitch import RMVPEExtractor
@@ -21,7 +21,19 @@ from modules.mel import MelExtractor
 from modules.vocoder import load_vocoder, vocode
 
 
-def load_model(checkpoint_path: str, device: str = "cuda"):
+def get_model_class(model_type: str = "base"):
+    if model_type == "turbo":
+        from modules.lyra_model_turbo import LyraModelTurbo
+        return LyraModelTurbo
+    return LyraModelBase
+
+
+def load_model(checkpoint_path: str, device: str = "cuda", model_type: str = None):
+    import yaml as _yaml
+    if model_type is None:
+        with open("config/config.yaml", "r", encoding="utf-8") as f:
+            model_type = _yaml.safe_load(f).get("model", {}).get("architecture", "base")
+    LyraModel = get_model_class(model_type)
     cfg = ModelConfig.from_yaml()
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
@@ -67,7 +79,7 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
 
 
 def convert(
-    model: LyraModel,
+    model,
     source_audio: str,
     output_audio: str,
     speaker_id: int = 0,
@@ -153,9 +165,10 @@ def convert(
 
     # Convert sample boundaries → mel frame boundaries
     seg_mel = []
+    mel_hop_sec = mel_hop / 44100
     for s, e, is_sil in seg_samples:
-        ms = s // mel_hop
-        me = e // mel_hop
+        ms = int(s / sr_src / mel_hop_sec)
+        me = int(e / sr_src / mel_hop_sec)
         if me > ms:
             seg_mel.append((ms, me, is_sil))
 
@@ -273,9 +286,11 @@ if __name__ == "__main__":
     parser.add_argument("--cfg", type=float, default=None, help="CFG scale")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save-mel", default=None, help="中间 mel 保存路径")
+    parser.add_argument("--model", type=str, default=None,
+                        help="模型架构: base / turbo，默认读 config")
     args = parser.parse_args()
 
-    model, cfg, ckpt = load_model(args.checkpoint, args.device)
+    model, cfg, ckpt = load_model(args.checkpoint, args.device, args.model)
     convert(model, args.source, args.output,
             speaker_id=args.speaker,
             steps=args.steps,

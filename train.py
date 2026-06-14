@@ -8,6 +8,7 @@ LyraSVC 训练脚本
 import os
 import random
 import time
+import glob
 import yaml
 import torch
 import torch.nn.functional as F
@@ -15,7 +16,13 @@ import numpy as np
 from contextlib import nullcontext
 from torch.utils.data import Dataset, DataLoader
 
-from modules.lyra_model import LyraModel, EMA
+from modules.lyra_model import LyraModel as LyraModelBase, EMA
+
+def get_model_class(model_type: str = "base"):
+    if model_type == "turbo":
+        from modules.lyra_model_turbo import LyraModelTurbo
+        return LyraModelTurbo
+    return LyraModelBase
 
 
 def load_config(config_path: str = "config/config.yaml") -> dict:
@@ -199,8 +206,13 @@ def run_validation(model, val_loader, device, use_amp, amp_dtype, dpm_steps):
 # Training Loop
 # ============================================================
 
-def train(resume_from=None):
+def train(resume_from=None, model_type=None):
     config = load_config()
+
+    # 模型类型: CLI 参数优先级 > config > 默认 base
+    if model_type is None:
+        model_type = config.get("model", {}).get("architecture", "base")
+    LyraModel = get_model_class(model_type)
 
     data_cfg = config.get("data", {})
     data_dir = data_cfg.get("processed", "data")
@@ -255,6 +267,7 @@ def train(resume_from=None):
                             collate_fn=collate_batch, num_workers=num_workers, pin_memory=True)
 
     print(f"Speakers: {speakers}")
+    print(f"Model: {model_type} ({LyraModel.__name__})")
     print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
     print(f"Batch: {batch_size} x {grad_accum} accum, Seg: {segment_len} frames "
           f"(~{segment_len/86:.1f}s)")
@@ -442,6 +455,101 @@ def train(resume_from=None):
                       f"SNR: {val_snr:.1f} | PSNR: {val_psnr:.1f} | SI-SNR: {val_sisnr:.1f} | "
                       f"best: {best_val_loss:.4f}")
 
+                # Spot check: short segment (training length)
+                try:
+                    sample_data = next(iter(val_loader))
+                    s_ppg = sample_data['ppg'][:1].to(device)
+                    s_f0 = sample_data['f0'][:1].to(device)
+                    s_mel = sample_data['mel'][:1].to(device)
+                    s_spk = sample_data['speaker_id'][:1].to(device)
+                    s_T = s_mel.shape[1]
+                    if s_T > model.segment_len:
+                        model.set_rope_scale(s_T / model.segment_len)
+                    gen_mel = model.sample(s_ppg, s_f0, s_mel, s_T, s_spk,
+                                          dpm_steps=8, cfg_scale=1.0, device=device)
+                    gen_mel = gen_mel.clamp(-12, 5)
+                    s_mel_clamped = s_mel.clamp(-12, 5)
+
+                    # Frame energy correlation (0..1): tracks source dynamics
+                    src_env = s_mel_clamped[0].norm(dim=-1)
+                    gen_env = gen_mel[0].norm(dim=-1)
+                    src_centered = src_env - src_env.mean()
+                    gen_centered = gen_env - gen_env.mean()
+                    denom = (src_centered.norm() * gen_centered.norm()).clamp(min=1e-8)
+                    fcorr = (src_centered * gen_centered).sum() / denom
+
+                    # Condition sensitivity: shuffle PPG → how much does output change?
+                    shuffled_ppg = s_ppg[:, torch.randperm(s_ppg.shape[1]), :]
+                    gen_shuffled = model.sample(shuffled_ppg, s_f0, s_mel, s_T, s_spk,
+                                                dpm_steps=8, cfg_scale=1.0, device=device)
+                    gen_shuffled = gen_shuffled.clamp(-12, 5)
+                    csens = F.mse_loss(gen_mel, gen_shuffled).item()
+
+                    print(f"  spot (T={s_T}): src_mean={s_mel_clamped.mean().item():.2f} src_std={s_mel_clamped.std().item():.2f} "
+                          f"gen_mean={gen_mel.mean().item():.2f} gen_std={gen_mel.std().item():.2f}  "
+                          f"fcorr={fcorr.item():.3f}  csens={csens:.4f}")
+                except Exception as e:
+                    print(f"  spot check failed: {e}")
+
+                # Full-length spot check: test YaRN extrapolation
+                try:
+                    full_files = []
+                    for spk in speakers:
+                        spk_dir_full = os.path.join(data_dir, spk)
+                        full_files.extend(glob.glob(os.path.join(spk_dir_full, "*_mel.npy")))
+                    if full_files:
+                        full_path = random.choice(full_files)
+                        prefix = full_path.replace("_mel.npy", "")
+                        full_mel = np.load(full_path).astype(np.float32)
+                        full_ppg = np.load(prefix + "_ppg.npy").astype(np.float32)
+                        full_f0 = np.load(prefix + "_f0.npy").astype(np.float32)
+                        if full_ppg.ndim == 3:
+                            full_ppg = full_ppg[0]
+                        full_mel = full_mel.T  # (T, 128)
+                        f_T = min(full_mel.shape[0], 1024)
+                        full_mel = full_mel[:f_T]
+                        rope_max = model.segment_len
+                        if f_T > rope_max:
+                            model.set_rope_scale(f_T / rope_max)
+
+                        f_ppg_t = torch.from_numpy(full_ppg).float().unsqueeze(0).to(device)
+                        f_f0_t = torch.from_numpy(full_f0).float().unsqueeze(0).to(device)
+                        f_mel_t = torch.from_numpy(full_mel).float().unsqueeze(0).to(device)
+                        f_spk = None
+                        for si, spk_name in enumerate(speakers):
+                            if spk_name in full_path:
+                                f_spk = si
+                                break
+                        if f_spk is None:
+                            f_spk = 0
+                        spk_t = torch.tensor([f_spk], dtype=torch.long, device=device)
+
+                        f_gen = model.sample(f_ppg_t, f_f0_t, f_mel_t, f_T, spk_t,
+                                            dpm_steps=8, cfg_scale=1.0, device=device)
+                        f_gen = f_gen.clamp(-12, 5)
+                        f_mel_c = f_mel_t.clamp(-12, 5)
+
+                        f_src_env = f_mel_c[0].norm(dim=-1)
+                        f_gen_env = f_gen[0].norm(dim=-1)
+                        f_sc = f_src_env - f_src_env.mean()
+                        f_gc = f_gen_env - f_gen_env.mean()
+                        f_fcorr = (f_sc * f_gc).sum() / (f_sc.norm() * f_gc.norm()).clamp(min=1e-8)
+
+                        f_shuf = f_ppg_t[:, torch.randperm(f_ppg_t.shape[1]), :]
+                        f_gen2 = model.sample(f_shuf, f_f0_t, f_mel_t, f_T, spk_t,
+                                             dpm_steps=8, cfg_scale=1.0, device=device)
+                        f_gen2 = f_gen2.clamp(-12, 5)
+                        f_csens = F.mse_loss(f_gen, f_gen2).item()
+
+                        # Reset RoPE scale for training
+                        model.set_rope_scale(1.0)
+
+                        print(f"  full (T={f_T}): src_mean={f_mel_c.mean().item():.2f} src_std={f_mel_c.std().item():.2f} "
+                              f"gen_mean={f_gen.mean().item():.2f} gen_std={f_gen.std().item():.2f}  "
+                              f"fcorr={f_fcorr.item():.3f}  csens={f_csens:.4f}")
+                except Exception:
+                    pass  # Full-length spot check is best-effort
+
                 checkpoint_dict = {
                     'epoch': epoch + 1, 'global_step': global_step,
                     'model_state_dict': model.state_dict(), 'ema_shadow': ema.shadow,
@@ -485,5 +593,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None, help="从 checkpoint 恢复训练")
+    parser.add_argument("--model", type=str, default=None,
+                        help="模型架构: base (完整单流) / turbo (锚点压缩)，默认读 config")
     args = parser.parse_args()
-    train(resume_from=args.resume)
+    train(resume_from=args.resume, model_type=args.model)
