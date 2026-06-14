@@ -1,11 +1,5 @@
 """
-LyraSVC Turbo — Anchor-compressed conditions + Mel self-attention
-==================================================================
-- Content/Pitch/Energy pooled to 16 anchor tokens each
-- Speaker pooled to 1 token
-- Mel keeps per-frame resolution (384 frames)
-- Total: 49 + T_mel ≈ 433 tokens (vs 1920 in base S3DiT)
-- Standalone file, no dependency on lyra_model.py
+LyraSVC Model Turbo
 """
 
 import math

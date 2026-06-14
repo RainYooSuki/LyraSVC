@@ -28,6 +28,11 @@ mel:
 
 model:
   architecture: base           # base/turbo
+# ---- Turbo 配置----
+  n_content_anchors: 16         # Content PPG 锚点数
+  n_pitch_anchors: 16           # Pitch 音高锚点数
+  n_energy_anchors: 16          # Energy 能量锚点数
+# -----------------------------------------
   ppg_dim: 1280                # Whisper encoder 输出维度
   hidden_dim: 768              # DiT hidden dim (S:384, B:768, L:1024, XL:1152)
   depth: 12                    # DiT blocks (S/B:12, L:24, XL:28)

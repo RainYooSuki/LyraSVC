@@ -29,7 +29,7 @@ def get_model_class(model_type: str = "base"):
 
 
 def load_model(checkpoint_path: str, device: str = "cuda", model_type: str = None):
-    import yaml as _yaml
+    import yaml as _yaml, os as _os
     if model_type is None:
         with open("config/config.yaml", "r", encoding="utf-8") as f:
             model_type = _yaml.safe_load(f).get("model", {}).get("architecture", "base")
@@ -37,8 +37,12 @@ def load_model(checkpoint_path: str, device: str = "cuda", model_type: str = Non
     cfg = ModelConfig.from_yaml()
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
+    with open("config/config.yaml", "r", encoding="utf-8") as f:
+        raw_cfg = _yaml.safe_load(f)
+    m_cfg = raw_cfg.get("model", {})
+
     speakers = ckpt.get("speakers", ["default"])
-    model = LyraModel(
+    model_kwargs = dict(
         num_speakers=len(speakers),
         ppg_dim=cfg.ppg_dim,
         hidden_dim=cfg.hidden_dim,
@@ -56,7 +60,12 @@ def load_model(checkpoint_path: str, device: str = "cuda", model_type: str = Non
         beta_start=cfg.diffusion_beta_start,
         beta_end=cfg.diffusion_beta_end,
         cfg_dropout_prob=cfg.cfg_dropout_prob,
-    ).to(device)
+    )
+    if model_type == "turbo":
+        model_kwargs["n_content_anchors"] = m_cfg.get("n_content_anchors", 16)
+        model_kwargs["n_pitch_anchors"] = m_cfg.get("n_pitch_anchors", 16)
+        model_kwargs["n_energy_anchors"] = m_cfg.get("n_energy_anchors", 16)
+    model = LyraModel(**model_kwargs).to(device)
 
     # 推理用 EMA 权重 (如果存在)
     has_ema = 'ema_shadow' in ckpt

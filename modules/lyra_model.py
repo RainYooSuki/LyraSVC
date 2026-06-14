@@ -1,11 +1,5 @@
 """
-LyraSVC Model — DDPM Diffusion + Single-Stream Transformer Backbone
-===================================================================
-Architecture:
-  1. Condition Encoders: Content, Pitch, Energy, Speaker
-  2. Single-stream transformer: all modalities concatenated in sequence
-  3. adaLN-Zero Transformer blocks with fused QKV, QK-Norm, SwiGLU
-  4. DDPM epsilon-prediction training + DPM-Solver++ sampling with CFG
+LyraSVC
 """
 
 import math
@@ -64,7 +58,7 @@ class DurationAwareContentEncoder(nn.Module):
         x = F.interpolate(x, size=target_len, mode='linear')
         x = self.post_conv(x)
         x = x.transpose(1, 2)
-        return x, torch.zeros(ppg.shape[0], ppg.shape[1], device=ppg.device)
+        return x, torch.zeros(ppg.shape[0], target_len, device=ppg.device)
 
 
 class ContinuousFreqEmbed(nn.Module):

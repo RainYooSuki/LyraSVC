@@ -276,7 +276,7 @@ def train(resume_from=None, model_type=None):
 
     # 模型
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = LyraModel(
+    model_kwargs = dict(
         num_speakers=len(speakers),
         ppg_dim=m_cfg.get("ppg_dim", 1280),
         hidden_dim=m_cfg.get("hidden_dim", 768),
@@ -294,7 +294,12 @@ def train(resume_from=None, model_type=None):
         beta_start=d_cfg.get("beta_start", 0.0001),
         beta_end=d_cfg.get("beta_end", 0.02),
         cfg_dropout_prob=d_cfg.get("cfg_dropout_prob", 0.1),
-    ).to(device)
+    )
+    if model_type == "turbo":
+        model_kwargs["n_content_anchors"] = m_cfg.get("n_content_anchors", 16)
+        model_kwargs["n_pitch_anchors"] = m_cfg.get("n_pitch_anchors", 16)
+        model_kwargs["n_energy_anchors"] = m_cfg.get("n_energy_anchors", 16)
+    model = LyraModel(**model_kwargs).to(device)
 
     use_8bit = t_cfg.get("optim_8bit", False)
     if use_8bit:
