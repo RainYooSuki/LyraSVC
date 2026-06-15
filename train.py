@@ -40,10 +40,11 @@ class SVCDataset(Dataset):
     """从预处理后的 data/ 目录加载 PPG + F0 + Mel，随机截取 segment_len 帧"""
 
     def __init__(self, data_dir: str, speakers: list, segment_len: int = 256,
-                 preload: bool = True):
+                 preload: bool = True, preload_workers: int = 8):
         self.data_dir = data_dir
         self.segment_len = segment_len
         self.preload = preload
+        self.preload_workers = preload_workers
         self.samples = []
         self._cache = {} if preload else None
 
@@ -60,8 +61,11 @@ class SVCDataset(Dataset):
 
         if preload:
             print(f"  Preloading {len(self.samples)} samples into RAM...")
-            for i in range(len(self.samples)):
-                self._cache[i] = self._load_raw(i)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=self.preload_workers) as pool:
+                results = list(pool.map(self._load_raw, range(len(self.samples))))
+            for i, data in enumerate(results):
+                self._cache[i] = data
             total_mb = sum(v['mel'].nbytes + v['ppg'].nbytes + v['f0'].nbytes
                           for v in self._cache.values()) / 1e6
             print(f"  Done ({total_mb:.0f}MB)")
@@ -252,7 +256,8 @@ def train(resume_from=None, model_type=None):
 
     # Train/Val split
     random.seed(42)
-    full_dataset = SVCDataset(data_dir, speakers, segment_len=segment_len, preload=preload)
+    full_dataset = SVCDataset(data_dir, speakers, segment_len=segment_len, preload=preload,
+                              preload_workers=t_cfg.get("preload_workers", 8))
     indices = list(range(len(full_dataset)))
     random.shuffle(indices)
     split = int((1 - val_split) * len(indices))
@@ -294,8 +299,9 @@ def train(resume_from=None, model_type=None):
         beta_start=d_cfg.get("beta_start", 0.0001),
         beta_end=d_cfg.get("beta_end", 0.02),
         cfg_dropout_prob=d_cfg.get("cfg_dropout_prob", 0.1),
-        frame_local_layers=m_cfg.get("frame_local_layers", 1),
     )
+    if model_type != "turbo":
+        model_kwargs["frame_local_layers"] = m_cfg.get("frame_local_layers", 1)
     model = LyraModel(**model_kwargs).to(device)
 
     use_8bit = t_cfg.get("optim_8bit", False)
@@ -487,8 +493,10 @@ def train(resume_from=None, model_type=None):
                     gen_shuffled = gen_shuffled.clamp(-12, 5)
                     csens = F.mse_loss(gen_mel, gen_shuffled).item()
 
-                    print(f"  spot (T={s_T}): src_mean={s_mel_clamped.mean().item():.2f} src_std={s_mel_clamped.std().item():.2f} "
-                          f"gen_mean={gen_mel.mean().item():.2f} gen_std={gen_mel.std().item():.2f}  "
+                    s_mean_diff = gen_mel.mean().item() - s_mel_clamped.mean().item()
+                    s_std_diff = gen_mel.std().item() - s_mel_clamped.std().item()
+                    print(f"  spot (T={s_T}): mean={s_mel_clamped.mean().item():.2f}/{gen_mel.mean().item():.2f} (Δ{s_mean_diff:+.2f}) "
+                          f"std={s_mel_clamped.std().item():.2f}/{gen_mel.std().item():.2f} (Δ{s_std_diff:+.2f})  "
                           f"fcorr={fcorr.item():.3f}  csens={csens:.4f}")
                 except Exception as e:
                     print(f"  spot check failed: {e}")
@@ -546,8 +554,8 @@ def train(resume_from=None, model_type=None):
                         # Reset RoPE scale for training
                         model.set_rope_scale(1.0)
 
-                        print(f"  full (T={f_T}): src_mean={f_mel_c.mean().item():.2f} src_std={f_mel_c.std().item():.2f} "
-                              f"gen_mean={f_gen.mean().item():.2f} gen_std={f_gen.std().item():.2f}  "
+                        print(f"  full (T={f_T}): mean={f_mel_c.mean().item():.2f}/{f_gen.mean().item():.2f} (Δ{f_gen.mean().item()-f_mel_c.mean().item():+.2f}) "
+                              f"std={f_mel_c.std().item():.2f}/{f_gen.std().item():.2f} (Δ{f_gen.std().item()-f_mel_c.std().item():+.2f})  "
                               f"fcorr={f_fcorr.item():.3f}  csens={f_csens:.4f}")
                 except Exception:
                     pass  # Full-length spot check is best-effort
