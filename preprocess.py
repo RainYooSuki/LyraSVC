@@ -52,17 +52,27 @@ def preprocess():
         print(f"No audio found in {raw_dir}")
         return
 
-    total = sum(len(v) for v in audio_by_speaker.values())
-    print(f"Found {total} files across {len(audio_by_speaker)} speaker(s)")
-    print()
-
-    # 收集全部音频路径和输出目录映射
-    all_audio = []  # (audio_path, speaker_name, output_dir)
+    # 收集全部音频路径
+    all_audio = []
     for speaker, audio_list in audio_by_speaker.items():
         spk_out = os.path.join(out_dir, speaker)
         os.makedirs(spk_out, exist_ok=True)
         for path in audio_list:
             all_audio.append((path, speaker, spk_out))
+
+    # 过滤已存在的文件 (增量预处理)
+    new_audio = []
+    for path, speaker, spk_out in all_audio:
+        name = os.path.splitext(os.path.basename(path))[0]
+        if not os.path.exists(os.path.join(spk_out, f"{name}_mel.npy")):
+            new_audio.append((path, speaker, spk_out))
+    if not new_audio:
+        print("All files already preprocessed, skipping.")
+        return
+    skipped = len(all_audio) - len(new_audio)
+    print(f"Found {len(all_audio)} files ({skipped} skipped, {len(new_audio)} new)")
+    all_audio = new_audio
+    total = len(all_audio)
 
     # 1. PPG (Whisper) — 边提取边存盘, 避免内存累积
     print(f"[1/3] PPG (Whisper, {total} files)...")
