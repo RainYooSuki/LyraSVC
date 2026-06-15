@@ -13,7 +13,7 @@ import numpy as np
 import librosa
 import soundfile as sf
 
-from modules.lyra_model import LyraModel as LyraModelBase, ModelConfig, SPEC_MIN, SPEC_MAX
+from modules.lyra_model_orion import LyraModelOrion, SPEC_MIN, SPEC_MAX
 from modules.slicer import Slicer, cross_fade
 from modules.whisper_ppg import WhisperPPGExtractor
 from modules.pitch import RMVPEExtractor
@@ -21,46 +21,50 @@ from modules.mel import MelExtractor
 from modules.vocoder import load_vocoder, vocode
 
 
-def get_model_class(model_type: str = "base"):
-    if model_type == "turbo":
-        from modules.lyra_model_turbo import LyraModelTurbo
-        return LyraModelTurbo
-    return LyraModelBase
+def get_model_class(model_type: str = "orion"):
+    if model_type == "vela":
+        from modules.lyra_model_vela import LyraModelVela
+        return LyraModelVela
+    return LyraModelOrion
 
 
 def load_model(checkpoint_path: str, device: str = "cuda", model_type: str = None):
-    import yaml as _yaml, os as _os
-    if model_type is None:
-        with open("config/config.yaml", "r", encoding="utf-8") as f:
-            model_type = _yaml.safe_load(f).get("model", {}).get("architecture", "base")
-    LyraModel = get_model_class(model_type)
-    cfg = ModelConfig.from_yaml()
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    with open("config/config.yaml", "r", encoding="utf-8") as f:
-        raw_cfg = _yaml.safe_load(f)
-    m_cfg = raw_cfg.get("model", {})
+    # 从checkpoint读取模型参数(新格式) 或回退到config(旧格式)
+    if 'model_args' in ckpt:
+        model_kwargs = ckpt['model_args']
+        arch = ckpt.get('architecture', 'orion')
+    else:
+        import yaml as _yaml
+        with open("config/config.yaml", "r", encoding="utf-8") as f:
+            cfg_raw = _yaml.safe_load(f)
+        m_cfg = cfg_raw.get("model", {})
+        arch = m_cfg.get("architecture", "orion")
+        model_kwargs = dict(
+            num_speakers=len(ckpt.get("speakers", ["default"])),
+            ppg_dim=m_cfg.get("ppg_dim", 1280),
+            hidden_dim=m_cfg.get("hidden_dim", 768),
+            depth=m_cfg.get("depth", 12),
+            num_heads=m_cfg.get("num_heads", 12),
+            mlp_ratio=m_cfg.get("mlp_ratio", 4.0),
+            mel_bins=m_cfg.get("mel_bins", 128),
+            pitch_max_freq=m_cfg.get("pitch_max_freq", 2000.0),
+            use_ref_spk=m_cfg.get("use_ref_spk", True),
+            content_dim=m_cfg.get("content_dim", 1280),
+            segment_len=m_cfg.get("train", {}).get("segment_len", 384),
+            spec_min=m_cfg.get("spec_min", -12.0),
+            spec_max=m_cfg.get("spec_max", 5.0),
+            diffusion_timesteps=m_cfg.get("diffusion", {}).get("timesteps", 1000),
+            beta_start=m_cfg.get("diffusion", {}).get("beta_start", 0.0001),
+            beta_end=m_cfg.get("diffusion", {}).get("beta_end", 0.02),
+            cfg_dropout_prob=m_cfg.get("cfg_dropout_prob", 0.1),
+        )
 
-    speakers = ckpt.get("speakers", ["default"])
-    model_kwargs = dict(
-        num_speakers=len(speakers),
-        ppg_dim=cfg.ppg_dim,
-        hidden_dim=cfg.hidden_dim,
-        depth=cfg.depth,
-        num_heads=cfg.num_heads,
-        mlp_ratio=cfg.mlp_ratio,
-        mel_bins=cfg.mel_bins,
-        pitch_max_freq=cfg.pitch_max_freq,
-        use_ref_spk=cfg.use_ref_spk,
-        content_dim=cfg.content_dim,
-        segment_len=cfg.segment_len,
-        spec_min=cfg.spec_min,
-        spec_max=cfg.spec_max,
-        diffusion_timesteps=cfg.diffusion_timesteps,
-        beta_start=cfg.diffusion_beta_start,
-        beta_end=cfg.diffusion_beta_end,
-        cfg_dropout_prob=cfg.cfg_dropout_prob,
-    )
+    if model_type is not None:
+        arch = model_type
+    LyraModel = get_model_class(arch)
+
     model = LyraModel(**model_kwargs).to(device)
 
     # 推理用 EMA 权重 (如果存在)
@@ -78,9 +82,11 @@ def load_model(checkpoint_path: str, device: str = "cuda", model_type: str = Non
         model.load_state_dict(ckpt["model_state_dict"])
         print(f"  Warning: no EMA weights, using raw training weights")
     model.eval()
-    print(f"  Model: {checkpoint_path} (epoch {ckpt.get('epoch', '?')}, "
-          f"val_loss={ckpt.get('val_loss', 0):.4f})")
-    return model, cfg, ckpt
+    params_m = sum(p.numel() for p in model.parameters()) / 1e6
+    arch_name = "Orion" if arch == "orion" else "Vela"
+    print(f"  Arch: {arch_name} | {params_m:.0f}M params | epoch {ckpt.get('epoch', '?')} "
+          f"val_loss={ckpt.get('val_loss', 0):.4f}")
+    return model, ckpt
 
 
 def convert(
@@ -135,7 +141,7 @@ def convert(
     # 5. Slice by silence and process each segment
     spk_t = torch.tensor([speaker_id], dtype=torch.long, device=device)
     T_mel = energy_mel.shape[0]
-    train_len = cfg.segment_len
+    train_len = model.segment_len
     mel_hop = 512
     output_sr = 44100
 
@@ -292,10 +298,10 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save-mel", default=None, help="中间 mel 保存路径")
     parser.add_argument("--model", type=str, default=None,
-                        help="模型架构: base / turbo，默认读 config")
+                        help="模型架构: orion / vela，默认读 config")
     args = parser.parse_args()
 
-    model, cfg, ckpt = load_model(args.checkpoint, args.device, args.model)
+    model, ckpt = load_model(args.checkpoint, args.device, args.model)
     convert(model, args.source, args.output,
             speaker_id=args.speaker,
             steps=args.steps,

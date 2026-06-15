@@ -16,13 +16,13 @@ import numpy as np
 from contextlib import nullcontext
 from torch.utils.data import Dataset, DataLoader
 
-from modules.lyra_model import LyraModel as LyraModelBase, EMA
+from modules.lyra_model_orion import LyraModelOrion, EMA
 
-def get_model_class(model_type: str = "base"):
-    if model_type == "turbo":
-        from modules.lyra_model_turbo import LyraModelTurbo
-        return LyraModelTurbo
-    return LyraModelBase
+def get_model_class(model_type: str = "orion"):
+    if model_type == "vela":
+        from modules.lyra_model_vela import LyraModelVela
+        return LyraModelVela
+    return LyraModelOrion
 
 
 def load_config(config_path: str = "config/config.yaml") -> dict:
@@ -213,9 +213,9 @@ def run_validation(model, val_loader, device, use_amp, amp_dtype, dpm_steps):
 def train(resume_from=None, model_type=None):
     config = load_config()
 
-    # 模型类型: CLI 参数优先级 > config > 默认 base
+    # 模型类型: CLI 参数优先级 > config > 默认 orion
     if model_type is None:
-        model_type = config.get("model", {}).get("architecture", "base")
+        model_type = config.get("model", {}).get("architecture", "orion")
     LyraModel = get_model_class(model_type)
 
     data_cfg = config.get("data", {})
@@ -272,7 +272,7 @@ def train(resume_from=None, model_type=None):
                             collate_fn=collate_batch, num_workers=num_workers, pin_memory=True)
 
     print(f"Speakers: {speakers}")
-    print(f"Model: {model_type} ({LyraModel.__name__})")
+    print(f"Model: {model_type.capitalize()} ({LyraModel.__name__})")
     print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
     print(f"Batch: {batch_size} x {grad_accum} accum, Seg: {segment_len} frames "
           f"(~{segment_len/86:.1f}s)")
@@ -300,7 +300,7 @@ def train(resume_from=None, model_type=None):
         beta_end=d_cfg.get("beta_end", 0.02),
         cfg_dropout_prob=d_cfg.get("cfg_dropout_prob", 0.1),
     )
-    if model_type != "turbo":
+    if model_type == "orion":
         model_kwargs["frame_local_layers"] = m_cfg.get("frame_local_layers", 1)
     model = LyraModel(**model_kwargs).to(device)
 
@@ -567,6 +567,8 @@ def train(resume_from=None, model_type=None):
                     'scheduler_state_dict': scheduler.state_dict(),
                     'val_loss': val_loss, 'best_recon': best_recon,
                     'patience_counter': patience_counter, 'speakers': speakers,
+                    'architecture': model_type,
+                    'model_args': model_kwargs,
                 }
                 if use_amp:
                     checkpoint_dict['scaler_state_dict'] = scaler.state_dict()
@@ -604,6 +606,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None, help="从 checkpoint 恢复训练")
     parser.add_argument("--model", type=str, default=None,
-                        help="模型架构: base (完整单流) / turbo (锚点压缩)，默认读 config")
+                        help="模型架构: orion / vela，默认读 config")
     args = parser.parse_args()
     train(resume_from=args.resume, model_type=args.model)
