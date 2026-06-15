@@ -344,6 +344,14 @@ def train(resume_from=None, model_type=None):
                 else:
                     print(f"    {name}: initialized from average")
             ckpt['model_state_dict']['speaker_enc.lookup.weight'] = new_weight
+            # y_embedder 的 embedding table 也需要适配 (num_classes + 1, 最后一位是 CFG null)
+            old_y = ckpt['model_state_dict']['y_embedder.embedding_table.weight']
+            new_y = old_y[:-1].mean(0, keepdim=True).repeat(len(speakers) + 1, 1)
+            new_y[-1] = old_y[-1]  # 保留 CFG null 位
+            for new_idx, name in enumerate(speakers):
+                if name in old_speakers:
+                    new_y[new_idx] = old_y[old_speakers.index(name)]
+            ckpt['model_state_dict']['y_embedder.embedding_table.weight'] = new_y
             # 优化器和 EMA 状态不适合迁移, 丢弃
             for key in ['optimizer_state_dict', 'scheduler_state_dict',
                         'scaler_state_dict', 'ema_shadow']:
