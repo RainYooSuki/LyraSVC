@@ -58,6 +58,7 @@ class WhisperPPGExtractor:
 
             hidden = encoder_outputs.hidden_states[self.target_layer + 1]
             ppg = hidden.squeeze(0).cpu().float().numpy()
+            del encoder_outputs, hidden, inputs
 
             results.append(WhisperPPGResult(audio_path=path, ppg=ppg))
 

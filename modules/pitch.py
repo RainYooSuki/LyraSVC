@@ -65,28 +65,51 @@ class RMVPEExtractor:
             audio = [audio]
 
         import librosa
-        results = []
-        for idx, audio_path in enumerate(audio):
+        bs = batch_size or self.batch_size
+        seg_len = self.rmvpe.seg_length  # 5120 samples at 16kHz
+
+        # 1. Load all audio, pad to seg_len alignment
+        padded_wavs = []
+        for audio_path in audio:
             wav, sr = librosa.load(audio_path, sr=16000, mono=True)
             wav = wav.astype(np.float32)
             wav = wav / max(np.abs(wav).max(), 1.0)
+            orig_len = len(wav)
+            pad = (seg_len - (orig_len % seg_len)) % seg_len
+            if pad > 0:
+                wav = np.pad(wav, (0, pad))
+            padded_wavs.append((orig_len, wav))
 
-            f0 = self.rmvpe.infer_from_audio(
-                wav, sample_rate=16000, device=self.device, thred=0.03, use_viterbi=False
-            )
-            import librosa as _librosa
-            times = _librosa.frames_to_time(
-                np.arange(len(f0)), sr=16000, hop_length=160
-            )
-            results.append(PitchResult(audio_path=audio_path, f0=f0, time=times))
+        # 2. Group by exact padded length, batch within groups
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i, (orig_len, wav) in enumerate(padded_wavs):
+            groups[len(wav)].append((i, orig_len, wav))
 
-            if on_progress:
-                on_progress(idx + 1, len(audio))
+        results_list = [None] * len(padded_wavs)
+        processed = 0
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        for length, items in groups.items():
+            wavs_in_group = [w for _, _, w in items]
+            for batch_start in range(0, len(wavs_in_group), bs):
+                batch_wavs = wavs_in_group[batch_start:batch_start + bs]
+                batch_items = items[batch_start:batch_start + bs]
 
-        return results
+                f0s = self.rmvpe.infer_from_audio_batch(
+                    batch_wavs, sample_rate=16000, device=self.device, thred=0.03, use_viterbi=False
+                )
+
+                for (idx, orig_len, _), f0 in zip(batch_items, f0s):
+                    nf = orig_len // self.rmvpe.hop_length + 1
+                    f0_trimmed = f0[:nf] if len(f0) > nf else f0
+                    times = librosa.frames_to_time(np.arange(len(f0_trimmed)), sr=16000, hop_length=160)
+                    results_list[idx] = PitchResult(audio_path=audio[idx], f0=f0_trimmed, time=times)
+
+                if on_progress:
+                    processed += len(batch_items)
+                    on_progress(processed, len(padded_wavs))
+
+        return results_list
 
     @staticmethod
     def get_frame_rate() -> float:

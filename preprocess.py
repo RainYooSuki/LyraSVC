@@ -56,59 +56,62 @@ def preprocess():
     print(f"Found {total} files across {len(audio_by_speaker)} speaker(s)")
     print()
 
+    # 收集全部音频路径和输出目录映射
+    all_audio = []  # (audio_path, speaker_name, output_dir)
     for speaker, audio_list in audio_by_speaker.items():
         spk_out = os.path.join(out_dir, speaker)
         os.makedirs(spk_out, exist_ok=True)
-        n = len(audio_list)
-        print(f"[{speaker}] {n} files")
+        for path in audio_list:
+            all_audio.append((path, speaker, spk_out))
 
-        # 1. PPG (Qwen3-ASR, ~3.5GB)
-        print(f"  [1/3] PPG ...")
-        ppg_ext = WhisperPPGExtractor()
-        results = ppg_ext.extract(audio_list,
-                                  on_progress=lambda d, t: print(f"\r    {d}/{t}", end="", flush=True))
-        print()
-        for r in results:
-            name = os.path.splitext(os.path.basename(r.audio_path))[0]
-            np.save(os.path.join(spk_out, f"{name}_ppg.npy"), r.ppg)
-        del ppg_ext
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print(f"  [1/3] PPG ✓")
+    # 1. PPG (Whisper) — 边提取边存盘, 避免内存累积
+    print(f"[1/3] PPG (Whisper, {total} files)...")
+    ppg_ext = WhisperPPGExtractor()
+    for i, (path, _, spk_out) in enumerate(all_audio):
+        results = ppg_ext.extract([path])
+        name = os.path.splitext(os.path.basename(path))[0]
+        np.save(os.path.join(spk_out, f"{name}_ppg.npy"), results[0].ppg)
+        del results
+        print(f"\r  {i+1}/{total}", end="", flush=True)
+    print()
+    del ppg_ext
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"[1/3] PPG done\n")
 
-        # 2. F0 (RMVPE)
-        print(f"  [2/3] F0  ...")
-        pitch_ext = RMVPEExtractor()
-        def pitch_progress(done, total):
-            print(f"\r    {done}/{total}", end="", flush=True)
-        results = pitch_ext.extract(audio_list, on_progress=pitch_progress)
-        print()
-        for r in results:
-            name = os.path.splitext(os.path.basename(r.audio_path))[0]
-            np.save(os.path.join(spk_out, f"{name}_f0.npy"), r.f0)
-        del pitch_ext
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print(f"  [2/3] F0  ✓")
+    # 2. F0 (RMVPE) — 一次加载，处理全部
+    print(f"[2/3] F0 (RMVPE, {total} files)...")
+    pitch_ext = RMVPEExtractor()
+    results = pitch_ext.extract([p for p, _, _ in all_audio],
+                                on_progress=lambda d, t: print(f"\r  {d}/{t}", end="", flush=True))
+    print()
+    for (path, _, spk_out), r in zip(all_audio, results):
+        name = os.path.splitext(os.path.basename(path))[0]
+        np.save(os.path.join(spk_out, f"{name}_f0.npy"), r.f0)
+    del pitch_ext
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"[2/3] F0 done\n")
 
-        # 3. Mel (纯 CPU, 无模型)
-        print(f"  [3/3] Mel ...")
-        mel_ext = MelExtractor()
-        results = mel_ext.extract(audio_list,
-                                  on_progress=lambda d, t: print(f"\r    {d}/{t}", end="", flush=True))
-        print()
-        for r in results:
-            name = os.path.splitext(os.path.basename(r.audio_path))[0]
-            np.save(os.path.join(spk_out, f"{name}_mel.npy"), r.mel.cpu().numpy())
-        del mel_ext
-        print(f"  [3/3] Mel ✓")
+    # 3. Mel (nvSTFT) — 无模型，处理全部
+    print(f"[3/3] Mel (nvSTFT, {total} files)...")
+    mel_ext = MelExtractor()
+    results = mel_ext.extract([p for p, _, _ in all_audio],
+                              on_progress=lambda d, t: print(f"\r  {d}/{t}", end="", flush=True))
+    print()
+    for (path, _, spk_out), r in zip(all_audio, results):
+        name = os.path.splitext(os.path.basename(path))[0]
+        np.save(os.path.join(spk_out, f"{name}_mel.npy"), r.mel.cpu().numpy())
+    del mel_ext
+    print(f"[3/3] Mel done\n")
 
-        # 汇总
+    # 汇总
+    for speaker in audio_by_speaker:
+        spk_out = os.path.join(out_dir, speaker)
         ppg_files = {f for f in os.listdir(spk_out) if f.endswith('_ppg.npy')}
         f0_files = {f for f in os.listdir(spk_out) if f.endswith('_f0.npy')}
         mel_files = {f for f in os.listdir(spk_out) if f.endswith('_mel.npy')}
-        print(f"  Complete: {len(ppg_files)} PPG, {len(f0_files)} F0, {len(mel_files)} Mel")
-        print()
+        print(f"  [{speaker}] Complete: {len(ppg_files)} PPG, {len(f0_files)} F0, {len(mel_files)} Mel")
 
     print("Done.")
 
