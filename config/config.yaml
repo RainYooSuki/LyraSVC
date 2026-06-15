@@ -39,6 +39,7 @@ model:
   spec_min: -12.0              # Mel 值归一化下限 (dB)
   spec_max: 5.0                # Mel 值归一化上限 (dB)
   content_dim: 1280            # 内容编码器维度
+  frame_local_layers: 1        # 模型前N层使用帧内attention
 
 # ---- 扩散参数 (训练) ----
 

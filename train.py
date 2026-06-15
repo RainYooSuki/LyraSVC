@@ -294,6 +294,7 @@ def train(resume_from=None, model_type=None):
         beta_start=d_cfg.get("beta_start", 0.0001),
         beta_end=d_cfg.get("beta_end", 0.02),
         cfg_dropout_prob=d_cfg.get("cfg_dropout_prob", 0.1),
+        frame_local_layers=m_cfg.get("frame_local_layers", 1),
     )
     model = LyraModel(**model_kwargs).to(device)
 

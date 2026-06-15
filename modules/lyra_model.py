@@ -348,6 +348,56 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class FrameLocalBlock(nn.Module):
+    """帧内 attention: 每帧的 [c,p,e,s,m] 5 token 互相 attend, 不改序列长度。
+       384 组独立 5×5 attention 并行, 不使用 RoPE (同帧不需要位置信号).
+       共享 TransformerBlock 的参数结构, adaLN 使用全局 c。"""
+    def __init__(self, dim, n_heads=12, ffn_mult=4):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+
+        self.norm1 = RMSNorm(dim)
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
+        self.norm2 = RMSNorm(dim)
+        hidden_dim = int(dim * ffn_mult)
+        self.w1 = nn.Linear(dim, hidden_dim)
+        self.w2 = nn.Linear(hidden_dim, dim)
+        self.w3 = nn.Linear(dim, hidden_dim)
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim)
+        )
+
+    def forward(self, x, c):
+        B, N, D = x.shape
+        G = N // 5  # number of frames
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            self.adaLN_modulation(c).chunk(6, dim=1)
+
+        # Attention: (B, G*5, D) → (B*G, 5, D)
+        x_attn = self.norm1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        x_attn = x_attn.reshape(B * G, 5, D)
+        qkv = self.qkv(x_attn).reshape(B * G, 5, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        attn = F.scaled_dot_product_attention(q, k, v)
+        attn = attn.permute(0, 2, 1, 3).reshape(B * G, 5, D)
+        attn = attn.reshape(B, N, D)
+        x = x + gate_msa.unsqueeze(1) * self.proj(attn)
+
+        # FFN (global, same as TransformerBlock)
+        x_hidden = self.norm2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        x = x + gate_mlp.unsqueeze(1) * self.w2(F.silu(self.w1(x_hidden)) * self.w3(x_hidden))
+        return x
+
+
 # ============================================================
 # 7. Timestep & Label embedders
 # ============================================================
@@ -448,6 +498,7 @@ class LyraModel(nn.Module):
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
         cfg_dropout_prob: float = 0.1,
+        frame_local_layers: int = 0,
     ):
         super().__init__()
         self.mel_bins = mel_bins
@@ -455,6 +506,7 @@ class LyraModel(nn.Module):
         self.timesteps = diffusion_timesteps
         self.spec_min = spec_min
         self.spec_max = spec_max
+        self.frame_local_layers = frame_local_layers
 
         # --- Condition encoders ---
         self.content_enc = DurationAwareContentEncoder(ppg_dim, content_dim)
@@ -489,13 +541,15 @@ class LyraModel(nn.Module):
         self.modal_embed = nn.Parameter(torch.zeros(1, 5, hidden_dim))
         nn.init.normal_(self.modal_embed, std=0.02)
 
-        # --- Transformer blocks ---
-        self.blocks = nn.ModuleList([
-            TransformerBlock(hidden_dim, num_heads, ffn_mult=mlp_ratio)
-            for _ in range(depth)
-        ])
-        for block in self.blocks:
-            block.rotary_emb = self.rotary_emb
+        # --- Transformer blocks (前 N 层帧内, 后面全局) ---
+        self.blocks = nn.ModuleList()
+        for i in range(depth):
+            if i < frame_local_layers:
+                self.blocks.append(FrameLocalBlock(hidden_dim, num_heads, ffn_mult=mlp_ratio))
+            else:
+                blk = TransformerBlock(hidden_dim, num_heads, ffn_mult=mlp_ratio)
+                blk.rotary_emb = self.rotary_emb
+                self.blocks.append(blk)
 
         self.final_layer = FinalLayer(hidden_dim, mel_bins)
 
@@ -553,7 +607,8 @@ class LyraModel(nn.Module):
         ).to(next(self.parameters()).device)
         self.rotary_emb = new_rotary
         for block in self.blocks:
-            block.rotary_emb = new_rotary
+            if hasattr(block, 'rotary_emb'):
+                block.rotary_emb = new_rotary
 
     def q_sample(self, x_start, t, noise):
         a = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
