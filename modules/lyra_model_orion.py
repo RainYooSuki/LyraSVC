@@ -17,7 +17,6 @@ from copy import deepcopy
 # ============================================================
 
 class EMA(nn.Module):
-    """Exponential Moving Average: maintains a shadow copy of model weights."""
     def __init__(self, model: nn.Module, decay: float = 0.999):
         super().__init__()
         self.decay = decay
@@ -39,7 +38,6 @@ class EMA(nn.Module):
 # ============================================================
 
 class DurationAwareContentEncoder(nn.Module):
-    """PPG -> linear upsample -> mel frame-rate content features."""
     def __init__(self, input_dim=1280, hidden_dim=1280):
         super().__init__()
         self.pre_proj = nn.Conv1d(input_dim, hidden_dim, 1)
@@ -186,7 +184,7 @@ def denorm_spec(x):
 
 
 # ============================================================
-# YaRN RoPE
+# 2D RoPE helpers
 # ============================================================
 
 def rotate_half(x):
@@ -194,18 +192,22 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
+
 def apply_rotary_pos_emb(q, k, cos, sin):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+
 def _yarn_find_correction_dim(num_rotations, dim, base, max_pos):
     return (dim * math.log(max_pos / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
 
 def _yarn_find_correction_range(low_rot, high_rot, dim, base, max_pos):
     low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_pos))
     high = math.ceil(_yarn_find_correction_dim(high_rot, dim, base, max_pos))
     return max(low, 0), min(high, dim - 1)
+
 
 def _yarn_linear_ramp_mask(min_val, max_val, dim):
     if min_val == max_val:
@@ -213,65 +215,60 @@ def _yarn_linear_ramp_mask(min_val, max_val, dim):
     linear = (torch.arange(dim, dtype=torch.float32) - min_val) / (max_val - min_val)
     return torch.clamp(linear, 0, 1)
 
-def _yarn_get_mscale(scale=1.0):
-    if scale <= 1:
-        return 1.0
-    return 0.1 * math.log(scale) + 1.0
 
+# ============================================================
+# 2D RoPE
+# ============================================================
 
-class RotaryPositionEmbedding(nn.Module):
-    def __init__(
-        self,
-        dim: int = 64,
-        max_pos: int = 4096,
-        base: float = 10000.0,
-        scale: float = 1.0,
-        original_max_pos: int = 384,
-        extrapolation_factor: float = 1.0,
-        attn_factor: float = 1.0,
-        beta_fast: int = 32,
-        beta_slow: int = 1,
-    ):
+class RoPE2D(nn.Module):
+    """2D RoPE: head_dim into [frame_dim, modal_dim].
+       Frame axis uses YaRN for length extrapolation."""
+    def __init__(self, head_dim: int = 64, n_modalities: int = 5,
+                 base: float = 10000.0, train_frames: int = 384):
         super().__init__()
-        self.dim = dim
-        self.max_pos = max_pos
+        self.head_dim = head_dim
+        self.frame_dim = head_dim // 2
+        self.modal_dim = head_dim - self.frame_dim
+        self.n_modalities = n_modalities
         self.base = base
-        self.scale = scale
-        self.original_max_pos = original_max_pos
-        self.extrapolation_factor = extrapolation_factor
-        self.attn_factor = attn_factor
-        self.beta_fast = beta_fast
-        self.beta_slow = beta_slow
+        self.train_frames = train_frames
+        self.frame_scale = 1.0
 
-        pos_freqs = base ** (torch.arange(0, dim, 2).float() / dim)
-        inv_freq_ext = 1.0 / pos_freqs
-        inv_freq_int = 1.0 / (scale * pos_freqs)
+    def set_frame_scale(self, scale: float):
+        self.frame_scale = max(scale, 1.0)
 
-        low, high = _yarn_find_correction_range(beta_fast, beta_slow, dim, base, original_max_pos)
-        mask = (1 - _yarn_linear_ramp_mask(low, high, dim // 2)) * extrapolation_factor
-        inv_freq = inv_freq_int * (1 - mask) + inv_freq_ext * mask
+    def _build_axis_freqs(self, axis_dim: int, max_len: int,
+                          scale: float = 1.0, original_max: int = None):
+        pos_freqs = self.base ** (torch.arange(0, axis_dim, 2).float() / axis_dim)
+        if original_max is not None and scale > 1.0:
+            inv_freq_int = 1.0 / (scale * pos_freqs)
+            inv_freq_ext = 1.0 / pos_freqs
+            low, high = _yarn_find_correction_range(32, 1, axis_dim, self.base, original_max)
+            mask = (1 - _yarn_linear_ramp_mask(low, high, axis_dim // 2))
+            inv_freq = inv_freq_int * (1 - mask) + inv_freq_ext * mask
+        else:
+            inv_freq = 1.0 / pos_freqs
 
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.mscale = float(_yarn_get_mscale(scale) * attn_factor)
+        t = torch.arange(max_len).float()
+        angles = torch.outer(t, inv_freq)
+        angles = torch.cat([angles, angles], dim=-1)
+        return angles
 
-        self._cached_seq_len = max_pos
-        t = torch.arange(self._cached_seq_len, dtype=torch.float32)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", (emb.cos() * self.mscale), persistent=False)
-        self.register_buffer("sin_cached", (emb.sin() * self.mscale), persistent=False)
-
-    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype):
-        if seq_len > self._cached_seq_len:
-            self._cached_seq_len = seq_len
-            t = torch.arange(self._cached_seq_len, dtype=torch.float32, device=device)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
-            emb = torch.cat((freqs, freqs), dim=-1)
-            self.register_buffer("cos_cached", (emb.cos() * self.mscale).to(dtype), persistent=False)
-            self.register_buffer("sin_cached", (emb.sin() * self.mscale).to(dtype), persistent=False)
-
-        cos = self.cos_cached[:seq_len].to(device=device, dtype=dtype)
-        sin = self.sin_cached[:seq_len].to(device=device, dtype=dtype)
+    def get_freqs_2d(self, frame_ids, modal_ids, device):
+        if self.frame_scale > 1.0:
+            frame_ids = (frame_ids.float() / self.frame_scale).long()
+            frame_ids = frame_ids.clamp(0, self.train_frames - 1)
+        max_frame = int(frame_ids.max().item()) + 1
+        frame_angles = self._build_axis_freqs(
+            self.frame_dim, max_frame,
+            scale=self.frame_scale, original_max=self.train_frames
+        ).to(device)
+        modal_angles = self._build_axis_freqs(self.modal_dim, self.n_modalities).to(device)
+        f = frame_angles[frame_ids.long()]
+        m = modal_angles[modal_ids.long()]
+        angles = torch.cat([f, m], dim=-1)
+        cos = angles.cos()
+        sin = angles.sin()
         return cos[None, None, :, :], sin[None, None, :, :]
 
 
@@ -295,7 +292,6 @@ class RMSNorm(nn.Module):
 # ============================================================
 
 class TransformerBlock(nn.Module):
-    """Single-stream transformer block with fused QKV, QK-Norm, and RMSNorm."""
     def __init__(self, dim, n_heads=12, ffn_mult=4):
         super().__init__()
         self.n_heads = n_heads
@@ -321,19 +317,19 @@ class TransformerBlock(nn.Module):
             nn.Linear(dim, 6 * dim)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, pos_ids_2d=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
             self.adaLN_modulation(c).chunk(6, dim=1)
 
-        # Attention path
         x_norm = self.norm1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         B, N, D = x_norm.shape
         qkv = self.qkv(x_norm).reshape(B, N, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        if self.rotary_emb is not None:
-            cos, sin = self.rotary_emb(N, q.device, q.dtype)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if self.rotary_emb is not None and pos_ids_2d is not None:
+            frame_ids, modal_ids = pos_ids_2d
+            cos, sin = self.rotary_emb.get_freqs_2d(frame_ids, modal_ids, q.device)
+            q, k = apply_rotary_pos_emb(q, k, cos.to(dtype=q.dtype), sin.to(dtype=q.dtype))
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -342,16 +338,13 @@ class TransformerBlock(nn.Module):
         attn = attn.permute(0, 2, 1, 3).reshape(B, N, D)
         x = x + gate_msa.unsqueeze(1) * self.proj(attn)
 
-        # FFN path (SwiGLU)
         x_norm = self.norm2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
         x = x + gate_mlp.unsqueeze(1) * self.w2(F.silu(self.w1(x_norm)) * self.w3(x_norm))
         return x
 
 
 class FrameLocalBlock(nn.Module):
-    """帧内 attention: 每帧的 [c,p,e,s,m] 5 token 互相 attend, 不改序列长度。
-        每帧独立 5×5 attention 并行, 不使用 RoPE (同帧不需要位置信号).
-       共享 TransformerBlock 的参数结构, adaLN 使用全局 c。"""
+    """Per-frame attention: [c,p,e,s,m] 5 tokens self-attend within each frame."""
     def __init__(self, dim, n_heads=12, ffn_mult=4):
         super().__init__()
         self.n_heads = n_heads
@@ -374,13 +367,12 @@ class FrameLocalBlock(nn.Module):
             nn.Linear(dim, 6 * dim)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, pos_ids_2d=None):
         B, N, D = x.shape
-        G = N // 5  # number of frames
+        G = N // 5
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
             self.adaLN_modulation(c).chunk(6, dim=1)
 
-        # Attention: (B, G*5, D) → (B*G, 5, D)
         x_attn = self.norm1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         x_attn = x_attn.reshape(B * G, 5, D)
         qkv = self.qkv(x_attn).reshape(B * G, 5, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -392,7 +384,6 @@ class FrameLocalBlock(nn.Module):
         attn = attn.reshape(B, N, D)
         x = x + gate_msa.unsqueeze(1) * self.proj(attn)
 
-        # FFN (global, same as TransformerBlock)
         x_hidden = self.norm2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
         x = x + gate_mlp.unsqueeze(1) * self.w2(F.silu(self.w1(x_hidden)) * self.w3(x_hidden))
         return x
@@ -507,56 +498,41 @@ class LyraModelOrion(nn.Module):
         self.spec_min = spec_min
         self.spec_max = spec_max
         self.frame_local_layers = frame_local_layers
+        self.segment_len = segment_len
 
-        # --- Condition encoders ---
         self.content_enc = DurationAwareContentEncoder(ppg_dim, content_dim)
         self.pitch_enc = PitchEncoder(64, max_freq=pitch_max_freq)
         self.energy_enc = EnergyEncoder(32)
         self.speaker_enc = SpeakerEncoder(num_speakers, 256, use_ref_spk)
 
-        # --- Timestep and label embedders ---
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.y_embedder = LabelEmbedder(num_speakers, hidden_dim, cfg_dropout_prob)
 
-        # --- YaRN RoPE ---
-        # Orion concatenates 5 modalities in a single stream: total seq_len = 5 * T_mel
         head_dim = hidden_dim // num_heads
-        self.segment_len = segment_len
-        self.rotary_emb = RotaryPositionEmbedding(
-            dim=head_dim,
-            max_pos=16384,
-            base=10000.0,
-            scale=1.0,
-            original_max_pos=segment_len * 5,
-        )
+        self.rope_2d = RoPE2D(head_dim=head_dim, n_modalities=5,
+                               base=10000.0, train_frames=segment_len)
 
-        # --- Token projections for each modality ---
         self.content_token = nn.Linear(content_dim, hidden_dim)
         self.pitch_token = nn.Linear(64, hidden_dim)
         self.energy_token = nn.Linear(32, hidden_dim)
         self.speaker_token = nn.Linear(256, hidden_dim)
         self.mel_token = nn.Linear(mel_bins, hidden_dim)
 
-        # --- Learnable modality embeddings ---
         self.modal_embed = nn.Parameter(torch.zeros(1, 5, hidden_dim))
         nn.init.normal_(self.modal_embed, std=0.02)
 
-        # --- Transformer blocks (前 N 层帧内, 后面全局) ---
         self.blocks = nn.ModuleList()
         for i in range(depth):
             if i < frame_local_layers:
                 self.blocks.append(FrameLocalBlock(hidden_dim, num_heads, ffn_mult=mlp_ratio))
             else:
                 blk = TransformerBlock(hidden_dim, num_heads, ffn_mult=mlp_ratio)
-                blk.rotary_emb = self.rotary_emb
+                blk.rotary_emb = self.rope_2d
                 self.blocks.append(blk)
 
         self.final_layer = FinalLayer(hidden_dim, mel_bins)
 
-        # --- Build noise schedule ---
         self._build_noise_schedule(diffusion_timesteps, beta_start, beta_end)
-
-        # --- Weight initialization ---
         self._init_weights()
 
     def _build_noise_schedule(self, timesteps, beta_start, beta_end):
@@ -579,7 +555,6 @@ class LyraModelOrion(nn.Module):
 
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         for block in self.blocks:
@@ -591,24 +566,14 @@ class LyraModelOrion(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
+    def _get_pos_ids_2d(self, T_mel, device):
+        frame_ids = torch.arange(T_mel, device=device).repeat_interleave(5)
+        modal_ids = torch.tensor([0, 1, 2, 3, 4], device=device).repeat(T_mel)
+        return frame_ids, modal_ids
+
     def set_rope_scale(self, scale: float):
-        head_dim = self.hidden_dim // self.blocks[0].n_heads
-        old = self.rotary_emb
-        new_rotary = RotaryPositionEmbedding(
-            dim=head_dim,
-            max_pos=16384,
-            base=old.base,
-            scale=scale,
-            original_max_pos=self.segment_len * 5,
-            extrapolation_factor=old.extrapolation_factor,
-            attn_factor=old.attn_factor,
-            beta_fast=old.beta_fast,
-            beta_slow=old.beta_slow,
-        ).to(next(self.parameters()).device)
-        self.rotary_emb = new_rotary
-        for block in self.blocks:
-            if hasattr(block, 'rotary_emb'):
-                block.rotary_emb = new_rotary
+        """YaRN frame-axis scale for long sequences (e.g. T/384)."""
+        self.rope_2d.set_frame_scale(scale)
 
     def q_sample(self, x_start, t, noise):
         a = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
@@ -628,7 +593,6 @@ class LyraModelOrion(nn.Module):
     ) -> torch.Tensor:
         B, T_mel, _ = x.shape
 
-        # 1. Encode conditions
         content, _ = self.content_enc(ppg, T_mel)
         pitch, _ = self.pitch_enc(f0, T_mel)
         energy = self.energy_enc(energy_mel)
@@ -641,30 +605,27 @@ class LyraModelOrion(nn.Module):
         if speaker is None:
             speaker = torch.zeros(B, T_mel, 256, device=x.device)
 
-        # 2. Tokenize each modality
         mel_tokens = self.mel_token(x) + self.modal_embed[:, 0:1, :]
         content_tokens = self.content_token(content) + self.modal_embed[:, 1:2, :]
         pitch_tokens = self.pitch_token(pitch) + self.modal_embed[:, 2:3, :]
         energy_tokens = self.energy_token(energy) + self.modal_embed[:, 3:4, :]
         speaker_tokens = self.speaker_token(speaker) + self.modal_embed[:, 4:5, :]
 
-        # 3. Frame-interleaved concatenation: [c0,p0,e0,s0,m0, c1,p1,e1,s1,m1, ...]
         tokens = torch.stack([content_tokens, pitch_tokens, energy_tokens,
                               speaker_tokens, mel_tokens], dim=2).reshape(B, T_mel * 5, self.hidden_dim)
 
-        # 4. Timestep and speaker embedding for adaLN
         t_emb = self.t_embedder(t)
         force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
         spk_emb = self.y_embedder(speaker_ids, self.training, force_drop_ids=force_drop)
         c = t_emb + spk_emb
 
-        # 5. Transformer blocks
-        for block in self.blocks:
-            tokens = block(tokens, c)
+        pos_ids_2d = self._get_pos_ids_2d(T_mel, x.device)
 
-        # 6. Output only mel portion (modality index 4 in interleaved layout)
+        for block in self.blocks:
+            tokens = block(tokens, c, pos_ids_2d=pos_ids_2d)
+
         out = self.final_layer(tokens, c)
-        out = out[:, 4::5, :]  # every 5th token starting at index 4
+        out = out[:, 4::5, :]
         return out
 
     def train_loss(self, mel_real, ppg, f0, energy_mel, speaker_ids=None, ref_mel=None):
@@ -713,6 +674,8 @@ class LyraModelOrion(nn.Module):
         energy_t = self.energy_token(energy) + self.modal_embed[:, 3:4, :]
         speaker_t = self.speaker_token(speaker) + self.modal_embed[:, 4:5, :]
 
+        pos_ids_2d = self._get_pos_ids_2d(T_mel, device)
+
         from modules.dpm_solver import NoiseScheduleVP, DPM_Solver
 
         noise_schedule = NoiseScheduleVP(schedule='discrete', betas=self.betas)
@@ -729,7 +692,7 @@ class LyraModelOrion(nn.Module):
                 mel_t = self.mel_token(x) + self.modal_embed[:, 0:1, :]
                 tokens = torch.stack([content_t, pitch_t, energy_t, speaker_t, mel_t], dim=2).reshape(B, T_mel * 5, self.hidden_dim)
                 for block in self.blocks:
-                    tokens = block(tokens, c)
+                    tokens = block(tokens, c, pos_ids_2d=pos_ids_2d)
                 out = self.final_layer(tokens, c)
                 return out[:, 4::5, :]
 
@@ -843,6 +806,8 @@ if __name__ == "__main__":
         cfg_dropout_prob=cfg.cfg_dropout_prob,
     )
     model.cuda()
+    params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"Params: {params:.1f}M")
 
     B, T_ppg, T_f0, T_mel = 1, 30, 200, 170
     ppg = torch.randn(B, T_ppg, cfg.ppg_dim).cuda()
@@ -852,12 +817,8 @@ if __name__ == "__main__":
     spk_ids = torch.zeros(B, dtype=torch.long).cuda()
 
     eps = model(mel_real, t, ppg, f0, energy_mel=mel_real, speaker_ids=spk_ids)
-    print(f"Epsilon shape: {eps.shape}")
+    print(f"Forward eps shape: {eps.shape}")
 
-    eps_loss, _, _ = model.train_loss(
-        mel_real, ppg, f0, energy_mel=mel_real, speaker_ids=spk_ids
-    )
-    print(f"Eps loss: {eps_loss.item():.4f}")
-
-    params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Params: {params:.1f}M")
+    eps_loss, _, _ = model.train_loss(mel_real, ppg, f0, energy_mel=mel_real, speaker_ids=spk_ids)
+    print(f"Train loss: {eps_loss.item():.4f}")
+    print("OK")
