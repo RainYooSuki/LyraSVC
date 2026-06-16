@@ -4,7 +4,7 @@
 
 提供两种架构：
 - **Orion** — S³-DiT 帧交织单流
-- **Vela** — 逐帧 adaLN 注入 + mel self-attention
+- **Vela** — 逐帧 concat 条件注入 + mel self-attention
 
 ## 工作流程
 
@@ -27,7 +27,7 @@ LyraSVC/
 │   └── config.yaml                # 统一配置 (architecture, 训练, 推理)
 ├── modules/
 │   ├── lyra_model_orion.py       # Orion 模型 (S³-DiT 单流 + DDPM)
-│   ├── lyra_model_vela.py         # Vela 模型 (逐帧 adaLN, 独立文件)
+│   ├── lyra_model_vela.py         # Vela 模型 (逐帧 concat, 独立文件)
 │   ├── dpm_solver.py              # DPM-Solver++ ODE 求解器
 │   ├── slicer.py                  # 静音切片 + cross-fade
 │   ├── vocoder.py                 # NSF-HiFiGAN 声码器

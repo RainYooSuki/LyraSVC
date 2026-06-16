@@ -535,13 +535,8 @@ class LyraModelVela(nn.Module):
         self.energy_enc = EnergyEncoder(32)
         self.speaker_enc = SpeakerEncoder(num_speakers, 256, use_ref_spk)
 
-        # Per-frame condition projections (no pooling)
-        self.content_frame_proj = nn.Linear(content_dim, hidden_dim)
-        self.pitch_frame_proj = nn.Linear(64, hidden_dim)
-        self.energy_frame_proj = nn.Linear(32, hidden_dim)
-        self.speaker_frame_proj = nn.Linear(256, hidden_dim)
-
-        self.mel_token = nn.Linear(mel_bins, hidden_dim)
+        # Concat condition injection: [mel(128) | content(1280) | pitch(64) | energy(32) | speaker(256)]
+        self.input_proj = nn.Linear(mel_bins + content_dim + 64 + 32 + 256, hidden_dim)
 
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.y_embedder = LabelEmbedder(num_speakers, hidden_dim, cfg_dropout_prob)
@@ -617,7 +612,7 @@ class LyraModelVela(nn.Module):
             block.rotary_emb = new_rotary
 
     def _build_tokens(self, x, ppg, f0, energy_mel, speaker_ids, ref_mel):
-        """Encode conditions → per-frame projection + mel tokens."""
+        """Encode conditions → concat with mel → project into token space."""
         B, T_mel, _ = x.shape
 
         content, _ = self.content_enc(ppg, T_mel)
@@ -632,14 +627,10 @@ class LyraModelVela(nn.Module):
         if speaker is None:
             speaker = torch.zeros(B, T_mel, 256, device=x.device)
 
-        # Per-frame condition → adaLN bias (no pooling)
-        c_frame = (self.content_frame_proj(content) +
-                   self.pitch_frame_proj(pitch) +
-                   self.energy_frame_proj(energy) +
-                   self.speaker_frame_proj(speaker))
-
-        m_tokens = self.mel_token(x)  # (B, T_mel, D)
-        return m_tokens, c_frame
+        # Concat [mel | content | pitch | energy | speaker] → project
+        combined = torch.cat([x, content, pitch, energy, speaker], dim=-1)
+        tokens = self.input_proj(combined)
+        return tokens
 
     def q_sample(self, x_start, t, noise):
         a = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
@@ -659,12 +650,12 @@ class LyraModelVela(nn.Module):
     ) -> torch.Tensor:
         B, T_mel, _ = x.shape
 
-        tokens, c_frame = self._build_tokens(x, ppg, f0, energy_mel, speaker_ids, ref_mel)
+        tokens = self._build_tokens(x, ppg, f0, energy_mel, speaker_ids, ref_mel)
 
         t_emb = self.t_embedder(t)
         force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
         spk_emb = self.y_embedder(speaker_ids, self.training, force_drop_ids=force_drop)
-        c = t_emb.unsqueeze(1) + spk_emb.unsqueeze(1) + c_frame  # (B, T_mel, D)
+        c = t_emb + spk_emb
 
         for block in self.blocks:
             tokens = block(tokens, c)
@@ -701,9 +692,17 @@ class LyraModelVela(nn.Module):
         B = ppg.shape[0]
         T_mel = length
 
-        # Pre-build condition frame (content/pitch/energy/speaker don't change per DPM step)
-        dummy_mel = torch.zeros(B, T_mel, self.mel_bins, device=device)
-        _, c_frame_static = self._build_tokens(dummy_mel, ppg, f0, energy_mel, speaker_ids, ref_mel)
+        # Pre-build conditions (same per DPM step)
+        content, _ = self.content_enc(ppg, T_mel)
+        pitch, _ = self.pitch_enc(f0, T_mel)
+        energy = self.energy_enc(energy_mel)
+        if energy.shape[1] > T_mel:
+            energy = energy[:, :T_mel]
+        elif energy.shape[1] < T_mel:
+            energy = F.pad(energy, (0, 0, 0, T_mel - energy.shape[1]))
+        speaker = self.speaker_enc(speaker_ids, ref_mel, T_mel)
+        if speaker is None:
+            speaker = torch.zeros(B, T_mel, 256, device=device)
 
         from modules.dpm_solver import NoiseScheduleVP, DPM_Solver
 
@@ -713,13 +712,13 @@ class LyraModelVela(nn.Module):
             t_discrete = (t_continuous - 1.0 / self.timesteps) * self.timesteps
 
             def _forward(x, t_d, force_uncond):
-                m_tokens = self.mel_token(x)
+                combined = torch.cat([x, content, pitch, energy, speaker], dim=-1)
+                tokens = self.input_proj(combined)
                 t_emb = self.t_embedder(t_d)
                 force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
                 spk_emb = self.y_embedder(speaker_ids, False, force_drop_ids=force_drop)
-                c = t_emb.unsqueeze(1) + spk_emb.unsqueeze(1) + c_frame_static
+                c = t_emb + spk_emb
 
-                tokens = m_tokens
                 for block in self.blocks:
                     tokens = block(tokens, c)
                 out = self.final_layer(tokens, c)
