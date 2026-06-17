@@ -53,7 +53,7 @@ class DurationAwareContentEncoder(nn.Module):
     def forward(self, ppg: torch.Tensor, target_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         x = ppg.transpose(1, 2)
         x = self.pre_proj(x)
-        x = F.interpolate(x, size=target_len, mode='linear')
+        x = F.interpolate(x, size=target_len, mode='nearest')
         x = self.post_conv(x)
         x = x.transpose(1, 2)
         return x, torch.zeros(ppg.shape[0], target_len, device=ppg.device)

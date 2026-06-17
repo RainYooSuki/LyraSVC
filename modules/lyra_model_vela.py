@@ -53,7 +53,7 @@ class DurationAwareContentEncoder(nn.Module):
     def forward(self, ppg: torch.Tensor, target_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         x = ppg.transpose(1, 2)
         x = self.pre_proj(x)
-        x = F.interpolate(x, size=target_len, mode='linear')
+        x = F.interpolate(x, size=target_len, mode='nearest')
         x = self.post_conv(x)
         x = x.transpose(1, 2)
         return x, torch.zeros(ppg.shape[0], target_len, device=ppg.device)
@@ -535,8 +535,18 @@ class LyraModelVela(nn.Module):
         self.energy_enc = EnergyEncoder(32)
         self.speaker_enc = SpeakerEncoder(num_speakers, 256, use_ref_spk)
 
-        # Concat condition injection: [mel(128) | content(1280) | pitch(64) | energy(32) | speaker(256)]
-        self.input_proj = nn.Linear(mel_bins + content_dim + 64 + 32 + 256, hidden_dim)
+        # Gated Fusion: per-condition projections + learned gate
+        self.mel_proj     = nn.Linear(mel_bins, hidden_dim)
+        self.content_proj = nn.Linear(content_dim, hidden_dim)
+        self.pitch_proj   = nn.Linear(64, hidden_dim)
+        self.energy_proj  = nn.Linear(32, hidden_dim)
+        self.speaker_proj = nn.Linear(256, hidden_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim * 5, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 5),
+            nn.Sigmoid()
+        )
 
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.y_embedder = LabelEmbedder(num_speakers, hidden_dim, cfg_dropout_prob)
@@ -580,6 +590,16 @@ class LyraModelVela(nn.Module):
 
         self.apply(_basic_init)
 
+        for m in [self.mel_proj, self.content_proj, self.pitch_proj, self.energy_proj, self.speaker_proj]:
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+        for m in self.gate:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
@@ -612,7 +632,7 @@ class LyraModelVela(nn.Module):
             block.rotary_emb = new_rotary
 
     def _build_tokens(self, x, ppg, f0, energy_mel, speaker_ids, ref_mel):
-        """Encode conditions → concat with mel → project into token space."""
+        """Encode conditions → per-condition project → gated fusion."""
         B, T_mel, _ = x.shape
 
         content, _ = self.content_enc(ppg, T_mel)
@@ -627,9 +647,18 @@ class LyraModelVela(nn.Module):
         if speaker is None:
             speaker = torch.zeros(B, T_mel, 256, device=x.device)
 
-        # Concat [mel | content | pitch | energy | speaker] → project
-        combined = torch.cat([x, content, pitch, energy, speaker], dim=-1)
-        tokens = self.input_proj(combined)
+        m = self.mel_proj(x)
+        c = self.content_proj(content)
+        p = self.pitch_proj(pitch)
+        e = self.energy_proj(energy)
+        s = self.speaker_proj(speaker)
+
+        gates = self.gate(torch.cat([m, c, p, e, s], dim=-1))
+        tokens = (gates[:, :, 0:1] * m +
+                  gates[:, :, 1:2] * c +
+                  gates[:, :, 2:3] * p +
+                  gates[:, :, 3:4] * e +
+                  gates[:, :, 4:5] * s)
         return tokens
 
     def q_sample(self, x_start, t, noise):
@@ -712,8 +741,17 @@ class LyraModelVela(nn.Module):
             t_discrete = (t_continuous - 1.0 / self.timesteps) * self.timesteps
 
             def _forward(x, t_d, force_uncond):
-                combined = torch.cat([x, content, pitch, energy, speaker], dim=-1)
-                tokens = self.input_proj(combined)
+                m = self.mel_proj(x)
+                c = self.content_proj(content)
+                p = self.pitch_proj(pitch)
+                e_cond = self.energy_proj(energy)
+                s = self.speaker_proj(speaker)
+                gates = self.gate(torch.cat([m, c, p, e_cond, s], dim=-1))
+                tokens = (gates[:, :, 0:1] * m +
+                          gates[:, :, 1:2] * c +
+                          gates[:, :, 2:3] * p +
+                          gates[:, :, 3:4] * e_cond +
+                          gates[:, :, 4:5] * s)
                 t_emb = self.t_embedder(t_d)
                 force_drop = torch.ones(B, device=x.device, dtype=torch.long) if force_uncond else None
                 spk_emb = self.y_embedder(speaker_ids, False, force_drop_ids=force_drop)

@@ -26,6 +26,7 @@ class Slicer:
         self.min_length = round(sr * min_length / 1000 / self.hop_size)
         self.min_interval = round(min_interval / self.hop_size)
         self.max_sil_kept = round(sr * max_sil_kept / 1000 / self.hop_size)
+        self.min_samples = round(sr * min_length / 1000)
 
     def _apply_slice(self, waveform, begin, end):
         if len(waveform.shape) > 1:
@@ -38,8 +39,8 @@ class Slicer:
             samples = librosa.to_mono(waveform)
         else:
             samples = waveform
-        if samples.shape[0] <= self.min_length:
-            return {"0": {"slice": False, "split_time": f"0,{len(waveform)}"}}
+        if len(samples) <= self.min_samples:
+            return {"0": {"slice": False, "split_time": f"0,{len(samples)}"}}
         rms_list = librosa.feature.rms(y=samples, frame_length=self.win_size, hop_length=self.hop_size).squeeze(0)
         sil_tags = []
         silence_start = None
@@ -88,21 +89,22 @@ class Slicer:
             silence_end = min(total_frames, silence_start + self.max_sil_kept)
             pos = rms_list[silence_start: silence_end + 1].argmin() + silence_start
             sil_tags.append((pos, total_frames + 1))
+        total_samples = len(samples)
         if len(sil_tags) == 0:
-            return {"0": {"slice": False, "split_time": f"0,{len(waveform)}"}}
+            return {"0": {"slice": False, "split_time": f"0,{total_samples}"}}
         else:
             chunks = []
             if sil_tags[0][0]:
                 chunks.append(
-                    {"slice": False, "split_time": f"0,{min(waveform.shape[0], sil_tags[0][0] * self.hop_size)}"})
+                    {"slice": False, "split_time": f"0,{min(total_samples, sil_tags[0][0] * self.hop_size)}"})
             for i in range(0, len(sil_tags)):
                 if i:
                     chunks.append({"slice": False,
-                                   "split_time": f"{sil_tags[i - 1][1] * self.hop_size},{min(waveform.shape[0], sil_tags[i][0] * self.hop_size)}"})
+                                   "split_time": f"{sil_tags[i - 1][1] * self.hop_size},{min(total_samples, sil_tags[i][0] * self.hop_size)}"})
                 chunks.append({"slice": True,
-                               "split_time": f"{sil_tags[i][0] * self.hop_size},{min(waveform.shape[0], sil_tags[i][1] * self.hop_size)}"})
-            if sil_tags[-1][1] * self.hop_size < len(waveform):
-                chunks.append({"slice": False, "split_time": f"{sil_tags[-1][1] * self.hop_size},{len(waveform)}"})
+                               "split_time": f"{sil_tags[i][0] * self.hop_size},{min(total_samples, sil_tags[i][1] * self.hop_size)}"})
+            if sil_tags[-1][1] * self.hop_size < total_samples:
+                chunks.append({"slice": False, "split_time": f"{sil_tags[-1][1] * self.hop_size},{total_samples}"})
             chunk_dict = {}
             for i in range(len(chunks)):
                 chunk_dict[str(i)] = chunks[i]

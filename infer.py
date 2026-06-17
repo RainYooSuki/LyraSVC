@@ -162,6 +162,8 @@ def convert(
                     min_interval=300, hop_size=10, max_sil_kept=500)
     chunk_dict = slicer.slice(wav_src)
 
+    ctx_frames = 30
+
     # Build ordered list of (start_sample, end_sample, is_silent)
     seg_samples = []
     for k in sorted(chunk_dict.keys(), key=int):
@@ -205,14 +207,17 @@ def convert(
             print(f"  Segment {seg_idx+1}/{len(seg_mel)}: silence {seg_T} frames")
             continue
 
-        # Slice pre-extracted features to this segment
-        ppg_seg = ppg[int(mel_start * ppg.shape[0] / T_mel):int(mel_end * ppg.shape[0] / T_mel)]
-        f0_seg = f0[int(mel_start * len(f0) / T_mel):int(mel_end * len(f0) / T_mel)]
-        mel_seg = energy_mel[mel_start:mel_end]
+        # Slice pre-extracted features to this segment with context
+        ctx_start = max(0, mel_start - ctx_frames)
+        ctx_end = min(T_mel, mel_end + ctx_frames)
+        ppg_seg = ppg[int(ctx_start * ppg.shape[0] / T_mel):int(ctx_end * ppg.shape[0] / T_mel)]
+        f0_seg = f0[int(ctx_start * len(f0) / T_mel):int(ctx_end * len(f0) / T_mel)]
+        mel_seg = energy_mel[ctx_start:ctx_end]
+        gen_T = ctx_end - ctx_start
 
         # YaRN rope scale for this segment
-        if seg_T > train_len:
-            new_scale = seg_T / train_len
+        if gen_T > train_len:
+            new_scale = gen_T / train_len
         else:
             new_scale = 1.0
         if new_scale != rope_scale_now:
@@ -227,11 +232,15 @@ def convert(
 
         with torch.no_grad():
             mel_gen_seg = model.sample(
-                ppg_t, f0_t, energy_t, seg_T,
+                ppg_t, f0_t, energy_t, gen_T,
                 speaker_ids=spk_t, dpm_steps=dpm_steps,
                 cfg_scale=cfg_scale_val, device=device)
         mel_gen_seg = mel_gen_seg[0].cpu().float().numpy()
 
+        # Trim context back to original segment boundaries
+        left_trim = mel_start - ctx_start
+        mel_gen_seg = mel_gen_seg[left_trim : left_trim + seg_T]
+        f0_seg = f0_seg[left_trim : left_trim + seg_T]
         mel_gen_seg = np.clip(mel_gen_seg, SPEC_MIN, SPEC_MAX)
         seg_mel_pieces.append((mel_start, mel_gen_seg))
         print(f"ok")
